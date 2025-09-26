@@ -1,4 +1,4 @@
-// server.js (safe boot, realtime, with end-of-utterance + explicit input format)
+// server.js (safe boot, realtime, with debug + /dao-beep)
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
@@ -61,7 +61,7 @@ const client = new Client({
   partials: [Partials.GuildMember]
 });
 
-// ---- Slash Command Auto-Registration (only if envs exist) ----
+// ---- Slash Command Auto-Registration (adds /dao-beep) ----
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
   const commands = [
@@ -76,7 +76,8 @@ async function registerCommands() {
       name: 'dao-target',
       description: 'Switch mic target to another user',
       options: [{ name: 'user', description: 'User to target', type: 6, required: true }]
-    }
+    },
+    { name: 'dao-beep', description: 'Play a 1s test beep to verify playback' }
   ];
   await rest.put(Routes.applicationGuildCommands(APP_ID, GUILD_ID), { body: commands });
   log.info('Slash commands registered');
@@ -89,89 +90,7 @@ const playbackPCM = new PassThrough({ highWaterMark: 1 << 24 });
 const BYTES_PER_MS = 16000 * 2 / 1000;
 const chunkBytes = Math.max(10, Math.min(60, Number(CHUNK_MS))) * BYTES_PER_MS;
 
-let ws = null;
-let wantWs = false;
-let nextExpectedEventId = 1;
-const pendingAudio = new Map();
-let currentTargetUserId = null;
-
-async function getSignedUrl() {
-  const url = `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${encodeURIComponent(ELEVEN_AGENT_ID)}`;
-  const res = await fetch(url, { headers: { 'xi-api-key': ELEVEN_API_KEY } });
-  if (!res.ok) throw new Error(`get-signed-url failed: ${res.status}`);
-  return (await res.json()).signed_url;
-}
-
-async function connectElevenWS() {
-  if (ws || wantWs) return;
-  wantWs = true;
-
-  const url = (USE_SIGNED_URL === 'true')
-    ? await getSignedUrl()
-    : `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${encodeURIComponent(ELEVEN_AGENT_ID)}`;
-
-  ws = new WebSocket(url);
-  ws.on('open', () => {
-    log.info('Agent WS connected');
-    // initial hello
-    ws.send(JSON.stringify({ type: 'conversation_initiation_client_data' }));
-    // (NEW) declare our input format explicitly
-    ws.send(JSON.stringify({
-      type: 'session_update',
-      input_audio_format: {
-        encoding: 'pcm_s16le',
-        sample_rate_hz: 16000,
-        channels: 1
-      }
-    }));
-  });
-
-  ws.on('message', (raw) => {
-    try {
-      const data = JSON.parse(raw.toString());
-      if (data.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong', event_id: data.ping_event.event_id }));
-        return;
-      }
-      if (data.type === 'audio') {
-        // Optional debug: console.log('audio evt', data.audio_event.event_id);
-        const buf = Buffer.from(data.audio_event.audio_base_64, 'base64');
-        pendingAudio.set(data.audio_event.event_id, buf);
-        while (pendingAudio.has(nextExpectedEventId)) {
-          playbackPCM.write(pendingAudio.get(nextExpectedEventId));
-          pendingAudio.delete(nextExpectedEventId);
-          nextExpectedEventId++;
-        }
-      }
-    } catch {/* ignore non-JSON */}
-  });
-
-  ws.on('close', () => {
-    console.warn('Agent WS closed');
-    ws = null;
-    nextExpectedEventId = 1;
-    pendingAudio.clear();
-    if (wantWs && connection) {
-      setTimeout(() => connectElevenWS().catch(() => {}), 1500);
-    }
-  });
-
-  ws.on('error', (err) => console.error('Agent WS error', err));
-}
-
-function sendUserAudioChunk(buf) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ user_audio_chunk: buf.toString('base64') }));
-  }
-}
-
-// (NEW) signal end of user utterance so the agent replies
-function sendUserAudioEnd() {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ user_audio_end: true }));
-  }
-}
-
+// encoder: PCM16k mono -> Opus 48k stereo for Discord
 function pcmToDiscordOpus() {
   return new prism.FFmpeg({
     args: [
@@ -194,6 +113,18 @@ function ensureAudioPlayer() {
   return audioPlayer;
 }
 
+// test tone to verify playback path
+function playBeep() {
+  const sr = 16000, secs = 1;
+  const total = sr * secs;
+  const pcm = Buffer.alloc(total * 2);
+  for (let i = 0; i < total; i++) {
+    const sample = Math.sin(2 * Math.PI * 440 * (i / sr));
+    pcm.writeInt16LE((Math.max(-1, Math.min(1, sample)) * 32767) | 0, i * 2);
+  }
+  playbackPCM.write(pcm);
+}
+
 async function joinVoice(guild, voiceChannel) {
   connection = joinVoiceChannel({
     channelId: voiceChannel.id,
@@ -212,9 +143,14 @@ function leaveVoice() {
   if (ws) { try { ws.close(); } catch {} ws = null; }
 }
 
+// capture + chunking
+let currentTargetUserId = null;
+let bytesSent = 0;
+
 function listenToUser(userId) {
   if (!connection) return;
   currentTargetUserId = userId;
+  console.log('listenToUser ->', userId);
 
   const opusStream = connection.receiver.subscribe(userId, {
     end: { behavior: EndBehaviorType.AfterSilence, duration: 800 }
@@ -236,14 +172,15 @@ function listenToUser(userId) {
   downsampler.on('data', (chunk) => {
     sendBuffer = Buffer.concat([sendBuffer, chunk]);
     while (sendBuffer.length >= chunkBytes) {
-      sendUserAudioChunk(sendBuffer.subarray(0, chunkBytes));
+      const slice = sendBuffer.subarray(0, chunkBytes);
+      sendUserAudioChunk(slice);
       sendBuffer = sendBuffer.subarray(chunkBytes);
     }
   });
 
   downsampler.on('end', () => {
     if (sendBuffer.length) sendUserAudioChunk(sendBuffer);
-    sendUserAudioEnd(); // <-- important: announce utterance end so agent responds
+    sendUserAudioEnd(); // signal utterance end so agent replies
   });
 }
 
@@ -259,7 +196,6 @@ async function watchVoiceConnection(conn, guild, channel) {
     if (newState.status === VoiceConnectionStatus.Disconnected) {
       const attempts = (vcRetry.get(key) || 0) + 1;
       vcRetry.set(key, attempts);
-
       try {
         await Promise.race([
           entersState(conn, VoiceConnectionStatus.Signalling, 5_000),
@@ -295,6 +231,89 @@ async function watchVoiceConnection(conn, guild, channel) {
   });
 }
 
+// ---- ElevenLabs realtime WebSocket ----
+let ws = null;
+let wantWs = false;
+let nextExpectedEventId = 1;
+const pendingAudio = new Map();
+
+async function getSignedUrl() {
+  const url = `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${encodeURIComponent(ELEVEN_AGENT_ID)}`;
+  const res = await fetch(url, { headers: { 'xi-api-key': ELEVEN_API_KEY } });
+  if (!res.ok) throw new Error(`get-signed-url failed: ${res.status}`);
+  return (await res.json()).signed_url;
+}
+
+async function connectElevenWS() {
+  if (ws || wantWs) return;
+  wantWs = true;
+
+  const url = (USE_SIGNED_URL === 'true')
+    ? await getSignedUrl()
+    : `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${encodeURIComponent(ELEVEN_AGENT_ID)}`;
+
+  ws = new WebSocket(url);
+
+  ws.on('open', () => {
+    log.info('Agent WS connected');
+    ws.send(JSON.stringify({ type: 'conversation_initiation_client_data' }));
+    ws.send(JSON.stringify({
+      type: 'session_update',
+      input_audio_format: {
+        encoding: 'pcm_s16le',
+        sample_rate_hz: 16000,
+        channels: 1
+      }
+    }));
+  });
+
+  ws.on('message', (raw) => {
+    try {
+      const data = JSON.parse(raw.toString());
+      if (data.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong', event_id: data.ping_event.event_id }));
+        return;
+      }
+      if (data.type === 'audio') {
+        console.log('audio evt', data.audio_event.event_id, 'len', data.audio_event.audio_base_64.length);
+        const buf = Buffer.from(data.audio_event.audio_base_64, 'base64');
+        pendingAudio.set(data.audio_event.event_id, buf);
+        while (pendingAudio.has(nextExpectedEventId)) {
+          playbackPCM.write(pendingAudio.get(nextExpectedEventId));
+          pendingAudio.delete(nextExpectedEventId);
+          nextExpectedEventId++;
+        }
+      }
+    } catch {/* ignore non-JSON */}
+  });
+
+  ws.on('close', () => {
+    console.warn('Agent WS closed');
+    ws = null;
+    nextExpectedEventId = 1;
+    pendingAudio.clear();
+    if (wantWs && connection) {
+      setTimeout(() => connectElevenWS().catch(() => {}), 1500);
+    }
+  });
+
+  ws.on('error', (err) => console.error('Agent WS error', err));
+}
+
+function sendUserAudioChunk(buf) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ user_audio_chunk: buf.toString('base64') }));
+    bytesSent += buf.length;
+  }
+}
+function sendUserAudioEnd() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    console.log(`user_audio_end (sentBytes=${bytesSent})`);
+    ws.send(JSON.stringify({ user_audio_end: true }));
+    bytesSent = 0;
+  }
+}
+
 // ---- Slash command handling ----
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -314,7 +333,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.deferReply({ ephemeral: true });
       await joinVoice(interaction.guild, voice);
 
-      // undeafen / unmute the bot’s member after joining
+      // undeafen / unmute after joining
       try {
         const me = await interaction.guild.members.fetchMe();
         if (me?.voice) {
@@ -323,14 +342,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
       } catch {}
 
-      if (!ELEVEN_AGENT_ID) {
-        await interaction.editReply('Missing ELEVEN_AGENT_ID. Set it in Railway Variables.');
-        return;
-      }
-      if (USE_SIGNED_URL === 'true' && !ELEVEN_API_KEY) {
-        await interaction.editReply('Missing ELEVEN_API_KEY (signed URL mode). Set it in Railway Variables.');
-        return;
-      }
+      if (!ELEVEN_AGENT_ID) { await interaction.editReply('Missing ELEVEN_AGENT_ID. Set it in Railway Variables.'); return; }
+      if (USE_SIGNED_URL === 'true' && !ELEVEN_API_KEY) { await interaction.editReply('Missing ELEVEN_API_KEY (signed URL mode).'); return; }
 
       await connectElevenWS();
       listenToUser(interaction.user.id);
@@ -355,16 +368,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === 'dao-target') {
       const user = interaction.options.getUser('user', true);
       const member = await interaction.guild.members.fetch(user.id);
-      if (!connection) {
-        await interaction.reply({ content: 'Bot not in VC. Use /dao-join first.', ephemeral: true });
-        return;
-      }
+      if (!connection) { await interaction.reply({ content: 'Bot not in VC. Use /dao-join first.', ephemeral: true }); return; }
       if (member.voice?.channelId !== connection.joinConfig.channelId) {
         await interaction.reply({ content: 'That user is not in my voice channel.', ephemeral: true });
         return;
       }
       listenToUser(user.id);
       await interaction.reply({ content: `Now listening to <@${user.id}>.`, ephemeral: true });
+    }
+
+    if (interaction.commandName === 'dao-beep') {
+      if (!connection) { await interaction.reply({ content: 'I need to be in a VC. Use /dao-join first.', ephemeral: true }); return; }
+      playBeep();
+      await interaction.reply({ content: 'Beep played.', ephemeral: true });
     }
   } catch (err) {
     log.error(err);
