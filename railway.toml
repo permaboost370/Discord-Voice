@@ -1,0 +1,10 @@
+[env]
+PORT = "8080"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 100
+
+[service]
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
