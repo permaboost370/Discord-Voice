@@ -1,8 +1,9 @@
 // server.js — Discord <-> ElevenLabs realtime bridge
 // Reliable playback (raw Opus), buffered ElevenLabs utterances, VAD mic capture,
 // /dao-say to force speech, /tone to verify Discord playback.
-// Includes manual-end guarded receiver to avoid push-after-EOF.
-// Adds ELEVEN_GAIN to boost output loudness into Discord.
+// Manual-end guarded receiver to avoid push-after-EOF.
+// Output gain via ELEVEN_GAIN.
+// Stage channel: auto-unsuppress + undeafen/unmute.
 
 import 'dotenv/config';
 import express from 'express';
@@ -27,7 +28,7 @@ import { Readable } from 'stream';
 import { REST } from '@discordjs/rest';
 import { Routes } from 'discord-api-types/v10';
 
-// --- crash logging (do not kill, keep /health up) ---
+// --- crash logging (keep /health up) ---
 process.on('uncaughtException', (e) => console.error('UNCAUGHT', e));
 process.on('unhandledRejection', (e) => console.error('UNHANDLED', e));
 console.log('BOOT: starting server.js');
@@ -48,7 +49,7 @@ const {
   VAD_THRESHOLD = '800',
   VAD_HANG_MS = '300',
   IDLE_CLOSE_MS = '120000',
-  ELEVEN_GAIN = '2.5'    // software gain applied before Opus encoding (1.0 = no boost)
+  ELEVEN_GAIN = '2.5'    // software gain before Opus (1.0 = no boost)
 } = process.env;
 
 const log = pino({ level: LOG_LEVEL });
@@ -376,11 +377,13 @@ function forceSay(text) {
 
 // -------- Join/Leave --------
 async function joinVoice(guild, voiceChannel) {
+  console.log('Joined channel type:', voiceChannel.type);
   connection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId: guild.id,
     adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf: false, selfMute: false
+    selfDeaf: false,
+    selfMute: false
   });
 
   // Create player & subscribe once
@@ -392,6 +395,18 @@ async function joinVoice(guild, voiceChannel) {
   }
   const sub = connection.subscribe(audioPlayer);
   log.info('Subscribed to audioPlayer', { sub: !!sub });
+
+  // 🔊 UNSUPPRESS ON STAGE + UNDEAF/UNMUTE
+  try {
+    const me = await guild.members.fetchMe();
+    if (voiceChannel.type === ChannelType.GuildStageVoice) {
+      await me.voice.setSuppressed(false).catch(() => {});
+    }
+    await me.voice.setDeaf(false).catch(() => {});
+    await me.voice.setMute(false).catch(() => {});
+  } catch (e) {
+    console.warn('Could not unsuppress/undeaf/unmute bot:', e?.message || e);
+  }
 }
 
 function leaveVoice() {
@@ -407,9 +422,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.commandName === 'dao-join') {
       const member = await interaction.guild.members.fetch(interaction.user.id);
       const voice = member.voice?.channel;
-      if (!voice || voice.type !== ChannelType.GuildVoice) { await interaction.reply({ content: 'Join a voice channel first.', flags: 64 }); return; }
+      if (!voice || voice.type !== ChannelType.GuildVoice && voice.type !== ChannelType.GuildStageVoice) {
+        await interaction.reply({ content: 'Join a voice or stage channel first.', flags: 64 }); return;
+      }
       const perms = voice.permissionsFor(interaction.guild.members.me);
-      if (!perms?.has(PermissionsBitField.Flags.Connect) || !perms?.has(PermissionsBitField.Flags.Speak)) { await interaction.reply({ content: 'I need Connect & Speak perms.', flags: 64 }); return; }
+      if (!perms?.has(PermissionsBitField.Flags.Connect) || !perms?.has(PermissionsBitField.Flags.Speak)) {
+        await interaction.reply({ content: 'I need Connect & Speak perms.', flags: 64 }); return;
+      }
 
       await interaction.reply({ content: 'Joining…', flags: 64 });
       await joinVoice(interaction.guild, voice);
