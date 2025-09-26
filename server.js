@@ -2,6 +2,7 @@
 // Reliable playback (raw Opus), buffered ElevenLabs utterances, VAD mic capture,
 // /dao-say to force speech, /tone to verify Discord playback.
 // Includes manual-end guarded receiver to avoid push-after-EOF.
+// Adds ELEVEN_GAIN to boost output loudness into Discord.
 
 import 'dotenv/config';
 import express from 'express';
@@ -46,7 +47,8 @@ const {
   CHUNK_MS = '20',
   VAD_THRESHOLD = '800',
   VAD_HANG_MS = '300',
-  IDLE_CLOSE_MS = '120000'
+  IDLE_CLOSE_MS = '120000',
+  ELEVEN_GAIN = '2.5'    // software gain applied before Opus encoding (1.0 = no boost)
 } = process.env;
 
 const log = pino({ level: LOG_LEVEL });
@@ -86,10 +88,16 @@ function playPcm16kBufferOnce(pcm16kBuf) {
 
   const pcmSource = Readable.from(pcm16kBuf);
 
-  // 16k mono -> 48k stereo
+  // 16k mono -> 48k stereo with software gain (ELEVEN_GAIN)
   const resampler = new prism.FFmpeg({
     command: ffmpegPath,
-    args: ['-f','s16le','-ar','16000','-ac','1','-i','pipe:0','-f','s16le','-ar','48000','-ac','2','pipe:1']
+    args: [
+      '-f','s16le','-ar','16000','-ac','1',
+      '-i','pipe:0',
+      '-af', `volume=${parseFloat(ELEVEN_GAIN) || 1.0}`,
+      '-f','s16le','-ar','48000','-ac','2',
+      'pipe:1'
+    ]
   });
   resampler.on('error', (e) => console.error('ffmpeg resampler error:', e));
 
