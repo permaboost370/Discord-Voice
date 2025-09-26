@@ -1,5 +1,7 @@
 // server.js — Discord <-> ElevenLabs realtime bridge
-// Stable playback via raw Opus frames (no Ogg). VAD mic capture + /dao-say. Handles audio.delta & legacy audio.
+// Reliable playback (raw Opus), buffered ElevenLabs utterances, VAD mic capture,
+// /dao-say to force speech, /tone to verify Discord playback.
+// Includes manual-end guarded receiver to avoid push-after-EOF.
 
 import 'dotenv/config';
 import express from 'express';
@@ -20,11 +22,11 @@ import {
   NoSubscriberBehavior
 } from '@discordjs/voice';
 import prism from 'prism-media';
-import { PassThrough } from 'stream';
+import { Readable } from 'stream';
 import { REST } from '@discordjs/rest';
 import { Routes } from 'discord-api-types/v10';
 
-// --- crash logging ---
+// --- crash logging (do not kill, keep /health up) ---
 process.on('uncaughtException', (e) => console.error('UNCAUGHT', e));
 process.on('unhandledRejection', (e) => console.error('UNHANDLED', e));
 console.log('BOOT: starting server.js');
@@ -36,7 +38,7 @@ const {
   GUILD_ID,
   ELEVEN_API_KEY,
   ELEVEN_AGENT_ID,
-  ELEVEN_VOICE_ID,            // optional voice override
+  ELEVEN_VOICE_ID,       // optional override
   USE_SIGNED_URL = 'true',
   ENABLE_VAD = 'true',
   PORT = 8080,
@@ -49,11 +51,11 @@ const {
 
 const log = pino({ level: LOG_LEVEL });
 
-// --- Express healthcheck ---
+// --- HTTP health ---
 const app = express();
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.get('/', (_req, res) => res.status(200).send('alive'));
-app.listen(Number(PORT), '0.0.0.0', () => log.info(`HTTP up on :${PORT} (/health)`));
+app.listen(Number(PORT), '0.0.0.0', () => log.info(`HTTP up on :${PORT}`));
 
 // --- Discord client ---
 const client = new Client({
@@ -61,68 +63,43 @@ const client = new Client({
   partials: [Partials.GuildMember]
 });
 
-// ---- Slash Command Auto-Registration ----
+// ---- Commands ----
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
   const commands = [
-    { name: 'dao-join', description: 'Join your VC and start ElevenLabs realtime' },
-    { name: 'dao-leave', description: 'Leave the VC and stop session' },
-    { name: 'dao-beep', description: 'Play a 1s test beep' },
-    {
-      name: 'dao-say',
-      description: 'Ask the agent to say something',
-      options: [{ name: 'text', description: 'What to say', type: 3, required: true }]
-    }
+    { name: 'dao-join', description: 'Join your VC and start realtime' },
+    { name: 'dao-leave', description: 'Leave the VC' },
+    { name: 'dao-say', description: 'Force the agent to speak', options: [{ name: 'text', description: 'What to say', type: 3, required: true }] },
+    { name: 'tone', description: 'Play a 2s test tone (no ElevenLabs)' }
   ];
   await rest.put(Routes.applicationGuildCommands(APP_ID, GUILD_ID), { body: commands });
-  log.info('Slash commands registered');
+  log.info('Commands registered');
 }
 
-// ---------------- Playback chain (created once on join) ----------------
+// ---------------- Playback: raw Opus encoder (utterance-buffered) ----------------
 let connection = null;
 let audioPlayer = null;
 
-// Long-lived PCM16k source we write agent audio into
-const playbackPCM16k = new PassThrough({ highWaterMark: 1 << 24 });
+// Build a one-shot playback for a whole PCM16k utterance buffer
+function playPcm16kBufferOnce(pcm16kBuf) {
+  if (!pcm16kBuf || !pcm16kBuf.length) return;
 
-// Resample 16k mono PCM → 48k stereo PCM (Discord-native) via ffmpeg
-function createResampler16kTo48kStereo() {
-  const ff = new prism.FFmpeg({
+  const pcmSource = Readable.from(pcm16kBuf);
+
+  // 16k mono -> 48k stereo
+  const resampler = new prism.FFmpeg({
     command: ffmpegPath,
-    args: [
-      '-f', 's16le', '-ar', '16000', '-ac', '1',
-      '-i', 'pipe:0',
-      '-f', 's16le', '-ar', '48000', '-ac', '2',
-      'pipe:1'
-    ]
+    args: ['-f','s16le','-ar','16000','-ac','1','-i','pipe:0','-f','s16le','-ar','48000','-ac','2','pipe:1']
   });
-  ff.on('error', (e) => console.error('ffmpeg resample (16k→48k) error:', e));
-  return ff;
-}
+  resampler.on('error', (e) => console.error('ffmpeg resampler error:', e));
 
-// Encode 48k stereo PCM → raw Opus frames
-function createOpusEncoder() {
-  const enc = new prism.opus.Encoder({ rate: 48000, channels: 2, frameSize: 960 });
-  enc.on('error', (e) => console.error('Opus encoder error:', e));
-  return enc;
-}
+  // 48k stereo PCM -> raw Opus frames
+  const opusEnc = new prism.opus.Encoder({ rate: 48000, channels: 2, frameSize: 960 });
+  opusEnc.on('error', (e) => console.error('Opus encoder error:', e));
 
-let resampler = null;
-let opusEncoder = null;
+  pcmSource.pipe(resampler).pipe(opusEnc);
 
-function ensurePlaybackPipelineOnce() {
-  if (audioPlayer && resampler && opusEncoder) return;
-
-  if (!resampler) {
-    resampler = createResampler16kTo48kStereo();
-    playbackPCM16k.pipe(resampler);
-  }
-
-  if (!opusEncoder) {
-    opusEncoder = createOpusEncoder();
-    resampler.pipe(opusEncoder);
-  }
-
+  // Ensure player
   if (!audioPlayer) {
     audioPlayer = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
     audioPlayer.on('error', (e) => console.error('AudioPlayer error:', e));
@@ -130,41 +107,50 @@ function ensurePlaybackPipelineOnce() {
     audioPlayer.on(AudioPlayerStatus.Idle,    () => log.info('AudioPlayer: idle'));
   }
 
-  const resource = createAudioResource(opusEncoder, { inputType: StreamType.Opus });
+  const resource = createAudioResource(opusEnc, { inputType: StreamType.Opus });
   audioPlayer.play(resource);
-  log.info('Playback pipeline ready (PCM16k → 48k PCM → Opus frames → player)');
 }
 
-function playBeep() {
-  const sr = 16000, secs = 1, total = sr * secs;
+// Simple 2s tone (PCM16k) → same path
+function playTone2s() {
+  const sr = 16000, secs = 2, total = sr * secs;
   const pcm = Buffer.alloc(total * 2);
   for (let i = 0; i < total; i++) {
     const s = Math.sin(2 * Math.PI * 440 * (i / sr));
     pcm.writeInt16LE((Math.max(-1, Math.min(1, s)) * 32767) | 0, i * 2);
   }
-  const ok = playbackPCM16k.write(pcm);
-  log.info({ ok, bytes: pcm.length }, 'Beep PCM written');
+  playPcm16kBufferOnce(pcm);
 }
 
-// ---------------- ElevenLabs realtime WS ----------------
+// ---------------- ElevenLabs realtime WS (utterance buffering) ----------------
 let ws = null;
 let wantWs = false;
 let idleTimer = null;
 
+// Buffer an utterance: collect deltas, flush on audio.end or short idle
+let currentUtteranceChunks = [];
+let flushTimer = null;
+const FLUSH_IDLE_MS = 600;
+
 function resetIdleTimer() {
   if (idleTimer) clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => {
-    console.log(`Idle ${IDLE_CLOSE_MS}ms — closing WS`);
-    stopEleven();
-  }, Number(IDLE_CLOSE_MS));
+  idleTimer = setTimeout(() => { console.log(`Idle ${IDLE_CLOSE_MS}ms — closing WS`); stopEleven(); }, Number(IDLE_CLOSE_MS));
 }
 function stopEleven() { wantWs = false; if (ws) { try { ws.close(); } catch {} ws = null; } }
 
 async function getSignedUrl() {
-  const url = `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${encodeURIComponent(ELEVEN_AGENT_ID)}`;
-  const res = await fetch(url, { headers: { 'xi-api-key': ELEVEN_API_KEY } });
+  const res = await fetch(`https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${encodeURIComponent(ELEVEN_AGENT_ID)}`, { headers: { 'xi-api-key': ELEVEN_API_KEY } });
   if (!res.ok) throw new Error(`get-signed-url failed: ${res.status}`);
   return (await res.json()).signed_url;
+}
+
+function flushUtterance(reason = 'flush') {
+  if (!currentUtteranceChunks.length) return;
+  const pcm = Buffer.concat(currentUtteranceChunks);
+  currentUtteranceChunks = [];
+  clearTimeout(flushTimer); flushTimer = null;
+  console.log(`▶️  Playing buffered utterance (${pcm.length} bytes) reason=${reason}`);
+  playPcm16kBufferOnce(pcm);
 }
 
 async function connectElevenWS() {
@@ -205,25 +191,29 @@ async function connectElevenWS() {
         return;
       }
 
-      // Legacy single-chunk audio (PCM16k mono, base64)
+      // Legacy single-chunk audio (PCM16k mono)
       if (msg.type === 'audio' && msg.audio_event?.audio_base_64) {
         resetIdleTimer();
         const buf = Buffer.from(msg.audio_event.audio_base_64, 'base64');
-        const ok = playbackPCM16k.write(buf);
-        console.log('↓ audio (legacy)', buf.length, 'bytes', 'writeOK=', ok);
+        currentUtteranceChunks.push(buf);
+        if (flushTimer) clearTimeout(flushTimer);
+        flushTimer = setTimeout(() => flushUtterance('idle'), FLUSH_IDLE_MS);
+        console.log('↓ audio (legacy)', buf.length, 'bytes (buffering)');
         return;
       }
 
-      // Streaming audio (PCM16k mono)
+      // Streaming audio deltas (PCM16k mono)
       if (msg.type === 'audio.delta' && msg.delta) {
         resetIdleTimer();
         const buf = Buffer.from(msg.delta, 'base64');
-        const ok = playbackPCM16k.write(buf);
-        console.log('↓ audio.delta', buf.length, 'bytes', 'writeOK=', ok);
+        currentUtteranceChunks.push(buf);
+        if (flushTimer) clearTimeout(flushTimer);
+        flushTimer = setTimeout(() => flushUtterance('idle'), FLUSH_IDLE_MS);
+        // console.log('↓ audio.delta', buf.length, 'bytes (buffering)');
         return;
       }
 
-      if (msg.type === 'audio.end') { console.log('↓ audio.end'); return; }
+      if (msg.type === 'audio.end') { console.log('↓ audio.end (flushing)'); flushUtterance('audio.end'); return; }
 
       // Log everything else (errors, text, etc.)
       try {
@@ -245,7 +235,34 @@ async function connectElevenWS() {
   ws.on('error', (err) => console.error('Agent WS error', err));
 }
 
-// Mic → Eleven (VAD)
+// -------- Mic → Eleven (VAD) + guarded receive pipeline --------
+const BYTES_PER_MS = 16000 * 2 / 1000;
+const chunkBytes = Math.max(10, Math.min(60, Number(CHUNK_MS))) * BYTES_PER_MS;
+const VAD_THRESH = Number(VAD_THRESHOLD);
+const VAD_HANG = Number(VAD_HANG_MS);
+
+function rms(buf) {
+  let sum = 0;
+  for (let i = 0; i < buf.length; i += 2) { const s = buf.readInt16LE(i); sum += s * s; }
+  return Math.sqrt(sum / (buf.length / 2 || 1));
+}
+
+// --- receive pipeline guard to avoid push-after-EOF ---
+let recv = {
+  userId: null,
+  opus: null,
+  decoder: null,
+  downsampler: null,
+};
+
+function cleanupReceivePipeline(reason = 'cleanup') {
+  try { recv.opus?.removeAllListeners(); recv.opus?.destroy(); } catch {}
+  try { recv.decoder?.removeAllListeners(); recv.decoder?.destroy(); } catch {}
+  try { recv.downsampler?.removeAllListeners(); recv.downsampler?.destroy(); } catch {}
+  recv = { userId: null, opus: null, decoder: null, downsampler: null };
+  console.log('[recv] pipeline cleaned:', reason);
+}
+
 function sendUserAudioChunk(buf) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: buf.toString('base64') }));
@@ -265,7 +282,76 @@ function sendUserAudioEnd() {
   }
 }
 
-// Force agent to speak (/dao-say)
+function listenToUser(userId) {
+  if (!connection) return;
+
+  if (recv.userId === userId && recv.opus) {
+    console.log('[recv] already listening to', userId);
+    return;
+  }
+
+  // Stop old pipeline first
+  cleanupReceivePipeline('retarget');
+
+  recv.userId = userId;
+  console.log('listenToUser ->', userId);
+
+  // Manual end control to avoid push-after-EOF
+  const opusStream = connection.receiver.subscribe(userId, {
+    end: { behavior: EndBehaviorType.Manual }
+  });
+
+  const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+  const downsampler = new prism.FFmpeg({
+    command: ffmpegPath,
+    args: ['-f','s16le','-ar','48000','-ac','2','-i','pipe:0','-f','s16le','-ar','16000','-ac','1','pipe:1']
+  });
+
+  opusStream.pipe(decoder).pipe(downsampler);
+
+  recv.opus = opusStream;
+  recv.decoder = decoder;
+  recv.downsampler = downsampler;
+
+  opusStream.on('error', (e) => console.error('[recv] opus stream error:', e?.message || e));
+  decoder.on('error',    (e) => console.error('[recv] decoder error:', e?.message || e));
+  downsampler.on('error',(e) => console.error('[recv] downsampler error:', e?.message || e));
+
+  const manualStop = () => cleanupReceivePipeline('manualStop');
+  opusStream.on('end', manualStop);
+  opusStream.on('close', manualStop);
+
+  let sendBuffer = Buffer.alloc(0);
+  let talking = false;
+  let lastVoice = 0;
+
+  downsampler.on('data', (chunk) => {
+    const level = rms(chunk);
+    const now = Date.now();
+
+    if (level >= VAD_THRESH) {
+      talking = true;
+      lastVoice = now;
+      sendBuffer = Buffer.concat([sendBuffer, chunk]);
+    } else if (talking && (now - lastVoice) < VAD_HANG) {
+      sendBuffer = Buffer.concat([sendBuffer, chunk]);
+    }
+
+    while (talking && sendBuffer.length >= chunkBytes) {
+      sendUserAudioChunk(sendBuffer.subarray(0, chunkBytes));
+      sendBuffer = sendBuffer.subarray(chunkBytes);
+    }
+
+    if (talking && (now - lastVoice) >= VAD_HANG) {
+      if (sendBuffer.length) sendUserAudioChunk(sendBuffer);
+      sendBuffer = Buffer.alloc(0);
+      talking = false;
+      sendUserAudioEnd();
+    }
+  });
+}
+
+// -------- Force agent to speak (/dao-say) --------
 function forceSay(text) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
   ws.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'input_text', text } }));
@@ -280,142 +366,90 @@ function forceSay(text) {
   return true;
 }
 
-// ---------------- Mic capture (VAD) ----------------
-const BYTES_PER_MS = 16000 * 2 / 1000;
-const chunkBytes = Math.max(10, Math.min(60, Number(CHUNK_MS))) * BYTES_PER_MS;
-const VAD_THRESH = Number(VAD_THRESHOLD);
-const VAD_HANG = Number(VAD_HANG_MS);
-
-function rms(buf) {
-  let sum = 0;
-  for (let i = 0; i < buf.length; i += 2) { const s = buf.readInt16LE(i); sum += s * s; }
-  return Math.sqrt(sum / (buf.length / 2 || 1));
-}
-
-function listenToUser(userId) {
-  if (!connection) return;
-  console.log('listenToUser ->', userId);
-
-  const opusStream = connection.receiver.subscribe(userId, {
-    end: { behavior: EndBehaviorType.AfterSilence, duration: 800 }
-  });
-
-  const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
-  const downsampler = new prism.FFmpeg({
-    command: ffmpegPath,
-    args: ['-f','s16le','-ar','48000','-ac','2','-i','pipe:0','-f','s16le','-ar','16000','-ac','1','pipe:1']
-  });
-
-  opusStream.pipe(decoder).pipe(downsampler);
-
-  let sendBuffer = Buffer.alloc(0);
-  let vadTalking = false;
-  let vadLastVoiceAt = 0;
-
-  downsampler.on('data', (chunk) => {
-    const level = rms(chunk);
-    const now = Date.now();
-
-    if (level >= VAD_THRESH) {
-      vadTalking = true;
-      vadLastVoiceAt = now;
-      sendBuffer = Buffer.concat([sendBuffer, chunk]);
-    } else if (vadTalking && (now - vadLastVoiceAt) < VAD_HANG) {
-      sendBuffer = Buffer.concat([sendBuffer, chunk]);
-    }
-
-    while (vadTalking && sendBuffer.length >= chunkBytes) {
-      const slice = sendBuffer.subarray(0, chunkBytes);
-      sendUserAudioChunk(slice);
-      sendBuffer = sendBuffer.subarray(chunkBytes);
-    }
-
-    if (vadTalking && (now - vadLastVoiceAt) >= VAD_HANG) {
-      if (sendBuffer.length) sendUserAudioChunk(sendBuffer);
-      sendBuffer = Buffer.alloc(0);
-      vadTalking = false;
-      sendUserAudioEnd();
-    }
-  });
-}
-
-// ---------------- Join/Leave ----------------
+// -------- Join/Leave --------
 async function joinVoice(guild, voiceChannel) {
   connection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId: guild.id,
     adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf: false,
-    selfMute: false
+    selfDeaf: false, selfMute: false
   });
 
-  ensurePlaybackPipelineOnce(); // build once
-
+  // Create player & subscribe once
+  if (!audioPlayer) {
+    audioPlayer = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+    audioPlayer.on('error', (e) => console.error('AudioPlayer error:', e));
+    audioPlayer.on(AudioPlayerStatus.Playing, () => log.info('AudioPlayer: playing'));
+    audioPlayer.on(AudioPlayerStatus.Idle,    () => log.info('AudioPlayer: idle'));
+  }
   const sub = connection.subscribe(audioPlayer);
   log.info('Subscribed to audioPlayer', { sub: !!sub });
 }
 
 function leaveVoice() {
+  cleanupReceivePipeline('leaving VC');
   if (connection) { try { connection.destroy(); } catch {} connection = null; }
   stopEleven();
 }
 
-// ---------------- Slash commands ----------------
+// -------- Command handlers --------
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   try {
     if (interaction.commandName === 'dao-join') {
       const member = await interaction.guild.members.fetch(interaction.user.id);
       const voice = member.voice?.channel;
-      if (!voice || voice.type !== ChannelType.GuildVoice) { await interaction.reply({ content: 'Join a voice channel first.', ephemeral: true }); return; }
+      if (!voice || voice.type !== ChannelType.GuildVoice) { await interaction.reply({ content: 'Join a voice channel first.', flags: 64 }); return; }
       const perms = voice.permissionsFor(interaction.guild.members.me);
-      if (!perms?.has(PermissionsBitField.Flags.Connect) || !perms?.has(PermissionsBitField.Flags.Speak)) { await interaction.reply({ content: 'I need Connect & Speak perms.', ephemeral: true }); return; }
+      if (!perms?.has(PermissionsBitField.Flags.Connect) || !perms?.has(PermissionsBitField.Flags.Speak)) { await interaction.reply({ content: 'I need Connect & Speak perms.', flags: 64 }); return; }
 
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.reply({ content: 'Joining…', flags: 64 });
       await joinVoice(interaction.guild, voice);
 
-      if (!ELEVEN_AGENT_ID) { await interaction.editReply('Missing ELEVEN_AGENT_ID.'); return; }
-      if (USE_SIGNED_URL === 'true' && !ELEVEN_API_KEY) { await interaction.editReply('Missing ELEVEN_API_KEY.'); return; }
+      if (!ELEVEN_AGENT_ID) { await interaction.editReply({ content: 'Missing ELEVEN_AGENT_ID.' }); return; }
+      if (USE_SIGNED_URL === 'true' && !ELEVEN_API_KEY) { await interaction.editReply({ content: 'Missing ELEVEN_API_KEY.' }); return; }
 
       await connectElevenWS();
 
       if (ENABLE_VAD === 'true') {
         listenToUser(interaction.user.id);
-        await interaction.editReply('Joined VC and listening to you.');
+        await interaction.editReply({ content: 'Joined VC and listening to you.' });
       } else {
-        await interaction.editReply('Joined VC (VAD disabled). Use /dao-say to test speech.');
+        await interaction.editReply({ content: 'Joined VC (VAD disabled). Use /dao-say or /tone.' });
       }
     }
 
     if (interaction.commandName === 'dao-leave') {
       leaveVoice();
-      await interaction.reply({ content: 'Left VC and closed session.', ephemeral: true });
-    }
-
-    if (interaction.commandName === 'dao-beep') {
-      if (!connection) { await interaction.reply({ content: 'Not in a VC. Use /dao-join first.', ephemeral: true }); return; }
-      playBeep();
-      await interaction.reply({ content: 'Beep played.', ephemeral: true });
+      await interaction.reply({ content: 'Left VC and closed session.', flags: 64 });
     }
 
     if (interaction.commandName === 'dao-say') {
       const text = interaction.options.getString('text', true);
       const ok = forceSay(text);
-      await interaction.reply({ content: ok ? 'Asked the agent to speak.' : 'Agent not connected. Use /dao-join first.', ephemeral: true });
+      await interaction.reply({ content: ok ? 'Asked the agent to speak.' : 'Agent not connected. Use /dao-join first.', flags: 64 });
+    }
+
+    if (interaction.commandName === 'tone') {
+      if (!connection) { await interaction.reply({ content: 'Not in a VC. Use /dao-join first.', flags: 64 }); return; }
+      playTone2s();
+      await interaction.reply({ content: 'Playing 2s test tone.', flags: 64 });
     }
   } catch (e) {
     log.error(e);
-    if (interaction.deferred || interaction.replied) { await interaction.editReply('Error. Check logs.'); }
-    else { await interaction.reply({ content: 'Error. Check logs.', ephemeral: true }); }
+    try {
+      if (interaction.deferred || interaction.replied) await interaction.editReply({ content: 'Error. Check logs.' });
+      else await interaction.reply({ content: 'Error. Check logs.', flags: 64 });
+    } catch {}
   }
 });
 
-// ---- Start bot ----
+// --- Start ---
 (async () => {
   if (DISCORD_TOKEN && APP_ID && GUILD_ID) {
     try { await registerCommands(); await client.login(DISCORD_TOKEN); log.info('Discord bot logged in'); }
     catch (e) { console.error('Discord startup failed:', e?.message || e); }
   } else {
-    console.warn('Missing DISCORD_TOKEN/APP_ID/GUILD_ID. /health still OK.');
+    console.warn('Missing DISCORD_TOKEN/APP_ID/GUILD_ID.');
   }
 })();
