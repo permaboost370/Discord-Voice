@@ -4,12 +4,9 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "deploy:commands": "node deploy-commands.js"
+    "start": "node server.js"
   },
-  "engines": {
-    "node": ">=20"
-  },
+  "engines": { "node": ">=20" },
   "dependencies": {
     "@discordjs/opus": "^0.9.0",
     "@discordjs/rest": "^2.3.0",
