@@ -24,7 +24,8 @@ import prism from 'prism-media';
 import { PassThrough } from 'stream';
 import { REST } from '@discordjs/rest';
 import { Routes } from 'discord-api-types/v10';
-import { OpusEncoder } from '@discordjs/opus';
+import opusPkg from '@discordjs/opus';
+const { OpusEncoder } = opusPkg;
 
 // --- crash logging ---
 process.on('uncaughtException', (e) => { console.error('UNCAUGHT', e); process.exit(1); });
