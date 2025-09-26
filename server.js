@@ -1,5 +1,5 @@
 // server.js — Discord <-> ElevenLabs realtime bridge
-// Playback via Ogg/Opus (ffmpeg-static), VAD gating, idle-close, /dao-beep, /dao-brief, /dao-say
+// Playback via Ogg/Opus (ffmpeg-static), VAD gating, idle-close, /dao-beep, /dao-brief, /dao-say (forced-audio)
 
 import 'dotenv/config';
 import express from 'express';
@@ -26,7 +26,7 @@ import { PassThrough } from 'stream';
 import { REST } from '@discordjs/rest';
 import { Routes } from 'discord-api-types/v10';
 
-// --- crash logging (non-fatal to keep /health alive) ---
+// --- crash logging (keep process alive so /health works) ---
 process.on('uncaughtException', (e) => { console.error('UNCAUGHT', e); /* process.exit(1); */ });
 process.on('unhandledRejection', (e) => { console.error('UNHANDLED', e); /* process.exit(1); */ });
 console.log('BOOT: starting server.js');
@@ -72,7 +72,6 @@ const client = new Client({
 });
 
 // ---- Slash Command Auto-Registration ----
-// (If you prefer a separate commands.js, DELETE this function AND its call in the bootstrap below.)
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
   const commands = [
@@ -440,8 +439,11 @@ async function connectElevenWS() {
         return;
       }
 
-      // Uncomment to see other server events
-      // if (!['session.updated','response.created'].includes(msg.type)) console.log('WS EVENT', msg.type);
+      // --- catch-all logging to surface errors/warnings/text-only replies ---
+      try {
+        const preview = JSON.stringify(msg);
+        console.log('WS EVENT', msg.type, preview.length > 400 ? preview.slice(0, 400) + '…' : preview);
+      } catch {}
 
     } catch (e) {
       console.error('WS parse error', e);
@@ -549,12 +551,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: 'Agent not connected. Use /dao-join first.', ephemeral: true });
         return;
       }
+
+      // Variant A: wrapped response with explicit audio settings
       console.log('→ response.create (wrapped)', text);
       ws.send(JSON.stringify({
         type: 'response.create',
-        response: { instructions: text }
+        response: {
+          instructions: text,
+          modalities: ['audio'],
+          output_audio_format: {
+            encoding: 'pcm_s16le',
+            sample_rate_hz: 16000,
+            channels: 1
+          }
+        }
       }));
-      // compatibility variant (some agent configs expect flat fields)
+
+      // Variant B: minimal flat fields (compat)
       setTimeout(() => {
         console.log('→ response.create (minimal)', text);
         try {
@@ -565,6 +578,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }));
         } catch {}
       }, 250);
+
       await interaction.reply({ content: 'Asked the agent to speak.', ephemeral: true });
     }
 
