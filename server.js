@@ -1,5 +1,5 @@
 // server.js — Discord <-> ElevenLabs realtime bridge
-// Plays agent audio, listens via VAD (optional), and supports /dao-say for forced speech.
+// Stable playback: pipeline created once on join. VAD mic capture + /dao-say. Handles audio.delta & legacy audio.
 
 import 'dotenv/config';
 import express from 'express';
@@ -17,8 +17,6 @@ import {
   StreamType,
   EndBehaviorType,
   AudioPlayerStatus,
-  VoiceConnectionStatus,
-  entersState,
   NoSubscriberBehavior
 } from '@discordjs/voice';
 import prism from 'prism-media';
@@ -26,18 +24,19 @@ import { PassThrough } from 'stream';
 import { REST } from '@discordjs/rest';
 import { Routes } from 'discord-api-types/v10';
 
-// --- crash logging (keep alive to pass /health) ---
+// --- crash logging (keep alive for /health) ---
 process.on('uncaughtException', (e) => console.error('UNCAUGHT', e));
 process.on('unhandledRejection', (e) => console.error('UNHANDLED', e));
 console.log('BOOT: starting server.js');
 
+// --- env ---
 const {
   DISCORD_TOKEN,
   APP_ID,
   GUILD_ID,
   ELEVEN_API_KEY,
   ELEVEN_AGENT_ID,
-  ELEVEN_VOICE_ID,            // optional override
+  ELEVEN_VOICE_ID,            // optional voice override
   USE_SIGNED_URL = 'true',
   ENABLE_VAD = 'true',
   PORT = 8080,
@@ -45,7 +44,7 @@ const {
   CHUNK_MS = '20',
   VAD_THRESHOLD = '800',
   VAD_HANG_MS = '300',
-  IDLE_CLOSE_MS = '120000'    // give WS time during tests
+  IDLE_CLOSE_MS = '120000'    // generous while testing
 } = process.env;
 
 const log = pino({ level: LOG_LEVEL });
@@ -79,15 +78,14 @@ async function registerCommands() {
   log.info('Slash commands registered');
 }
 
-// ---------------- Playback chain ----------------
+// ---------------- Playback chain (created once on join) ----------------
 let connection = null;
 let audioPlayer = null;
-let shouldStayInVC = false;
+let oggOpus = null;
 
-// We write 16k mono PCM into this. It feeds the transcoder → Discord.
-let playbackPCM16k = new PassThrough({ highWaterMark: 1 << 24 });
+// Long-lived PCM16k source we write agent audio into
+const playbackPCM16k = new PassThrough({ highWaterMark: 1 << 24 });
 
-// Create an Ogg/Opus stream from PCM16k using ffmpeg-static (48k stereo out)
 function createTranscoder() {
   const ff = new prism.FFmpeg({
     command: ffmpegPath,
@@ -103,32 +101,24 @@ function createTranscoder() {
   return ff;
 }
 
-let oggOpus = null;
+function ensurePlaybackPipelineOnce() {
+  if (audioPlayer && oggOpus) return;
 
-// (Re)initialize the playback pipeline (PCM → Ogg/Opus → player)
-function ensurePlaybackPipeline() {
-  // tear down old if exists
-  try { oggOpus?.destroy(); } catch {}
-  oggOpus = createTranscoder();
-
-  // re-create the PCM source stream and wire it fresh
-  const old = playbackPCM16k;
-  playbackPCM16k = new PassThrough({ highWaterMark: 1 << 24 });
-  old.unpipe?.(); old.destroy?.();
-
-  playbackPCM16k.pipe(oggOpus);
-
-  if (!audioPlayer) {
-    audioPlayer = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play }});
-    audioPlayer.on('error', (e) => console.error('AudioPlayer error:', e));
-    audioPlayer.on(AudioPlayerStatus.Playing, () => log.info('AudioPlayer: playing'));
-    audioPlayer.on(AudioPlayerStatus.Idle, () => log.info('AudioPlayer: idle'));
+  if (!oggOpus) {
+    oggOpus = createTranscoder();
+    playbackPCM16k.pipe(oggOpus);
   }
 
-  // important: resource is the Ogg/Opus stream
+  if (!audioPlayer) {
+    audioPlayer = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+    audioPlayer.on('error', (e) => console.error('AudioPlayer error:', e));
+    audioPlayer.on(AudioPlayerStatus.Playing, () => log.info('AudioPlayer: playing'));
+    audioPlayer.on(AudioPlayerStatus.Idle,    () => log.info('AudioPlayer: idle'));
+  }
+
   const resource = createAudioResource(oggOpus, { inputType: StreamType.OggOpus });
   audioPlayer.play(resource);
-  log.info('Playback pipeline wired (PCM16k → OggOpus → player)');
+  log.info('Playback pipeline ready (PCM16k -> OggOpus -> player)');
 }
 
 function playBeep() {
@@ -142,7 +132,7 @@ function playBeep() {
   log.info({ ok, bytes: pcm.length }, 'Beep PCM written');
 }
 
-// ---------------- ElevenLabs WS ----------------
+// ---------------- ElevenLabs realtime WS ----------------
 let ws = null;
 let wantWs = false;
 let idleTimer = null;
@@ -154,10 +144,7 @@ function resetIdleTimer() {
     stopEleven();
   }, Number(IDLE_CLOSE_MS));
 }
-function stopEleven() {
-  wantWs = false;
-  if (ws) { try { ws.close(); } catch {} ws = null; }
-}
+function stopEleven() { wantWs = false; if (ws) { try { ws.close(); } catch {} ws = null; } }
 
 async function getSignedUrl() {
   const url = `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${encodeURIComponent(ELEVEN_AGENT_ID)}`;
@@ -180,9 +167,7 @@ async function connectElevenWS() {
     log.info('Agent WS connected');
     resetIdleTimer();
 
-    // Ensure playback is fully wired before any audio arrives
-    ensurePlaybackPipeline();
-
+    // DO NOT rebuild playback pipeline here; it's already created on join
     ws.send(JSON.stringify({ type: 'conversation_initiation_client_data' }));
     const sessionPayload = {
       type: 'session.update',
@@ -192,7 +177,6 @@ async function connectElevenWS() {
       }
     };
     if (ELEVEN_VOICE_ID) {
-      // different tenants accept either form; both are safe to include
       sessionPayload.session.voice_id = ELEVEN_VOICE_ID;
       sessionPayload.session.voice = { voice_id: ELEVEN_VOICE_ID };
     }
@@ -208,7 +192,7 @@ async function connectElevenWS() {
         return;
       }
 
-      // Legacy audio event
+      // Legacy single-chunk audio
       if (msg.type === 'audio' && msg.audio_event?.audio_base_64) {
         resetIdleTimer();
         const buf = Buffer.from(msg.audio_event.audio_base_64, 'base64'); // 16k mono PCM
@@ -217,7 +201,7 @@ async function connectElevenWS() {
         return;
       }
 
-      // Streaming audio chunks
+      // Streaming audio
       if (msg.type === 'audio.delta' && msg.delta) {
         resetIdleTimer();
         const buf = Buffer.from(msg.delta, 'base64'); // 16k mono PCM
@@ -226,12 +210,9 @@ async function connectElevenWS() {
         return;
       }
 
-      if (msg.type === 'audio.end') {
-        console.log('↓ audio.end');
-        return;
-      }
+      if (msg.type === 'audio.end') { console.log('↓ audio.end'); return; }
 
-      // Catch-all to surface server messages/errors
+      // See other events/errors
       try {
         const preview = JSON.stringify(msg);
         console.log('WS EVENT', msg.type, preview.length > 500 ? preview.slice(0, 500) + '…' : preview);
@@ -245,22 +226,16 @@ async function connectElevenWS() {
     console.warn('Agent WS closed');
     ws = null;
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-    if (wantWs && connection) {
-      setTimeout(() => connectElevenWS().catch(() => {}), 1500);
-    }
+    if (wantWs && connection) setTimeout(() => connectElevenWS().catch(() => {}), 1500);
   });
 
   ws.on('error', (err) => console.error('Agent WS error', err));
 }
 
-// Send mic audio → Eleven
+// Mic → Eleven (VAD)
 function sendUserAudioChunk(buf) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({
-      type: 'input_audio_buffer.append',
-      audio: buf.toString('base64')
-    }));
-    // console.log('↑ append', buf.length, 'bytes');
+    ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: buf.toString('base64') }));
   }
 }
 function sendUserAudioEnd() {
@@ -277,15 +252,10 @@ function sendUserAudioEnd() {
   }
 }
 
-// Force agent to speak (for /dao-say)
+// Force agent to speak (/dao-say)
 function forceSay(text) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-
-  ws.send(JSON.stringify({
-    type: 'conversation.item.create',
-    item: { type: 'input_text', text }
-  }));
-
+  ws.send(JSON.stringify({ type: 'conversation.item.create', item: { type: 'input_text', text } }));
   ws.send(JSON.stringify({
     type: 'response.create',
     response: {
@@ -330,7 +300,6 @@ function listenToUser(userId) {
   let vadLastVoiceAt = 0;
 
   downsampler.on('data', (chunk) => {
-    resetIdleTimer();
     const level = rms(chunk);
     const now = Date.now();
 
@@ -359,7 +328,6 @@ function listenToUser(userId) {
 
 // ---------------- Join/Leave ----------------
 async function joinVoice(guild, voiceChannel) {
-  shouldStayInVC = true;
   connection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId: guild.id,
@@ -368,15 +336,13 @@ async function joinVoice(guild, voiceChannel) {
     selfMute: false
   });
 
-  // Make sure playback pipeline is ready before any audio
-  ensurePlaybackPipeline();
+  ensurePlaybackPipelineOnce(); // build once here
 
   const sub = connection.subscribe(audioPlayer);
   log.info('Subscribed to audioPlayer', { sub: !!sub });
 }
 
 function leaveVoice() {
-  shouldStayInVC = false;
   if (connection) { try { connection.destroy(); } catch {} connection = null; }
   stopEleven();
 }
