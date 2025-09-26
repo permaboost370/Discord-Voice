@@ -1,4 +1,4 @@
-// server.js (safe boot, corrected + undeafen on join)
+// server.js (safe boot, realtime, with end-of-utterance + explicit input format)
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
@@ -13,14 +13,16 @@ import {
   createAudioResource,
   StreamType,
   EndBehaviorType,
-  AudioPlayerStatus
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+  entersState
 } from '@discordjs/voice';
 import prism from 'prism-media';
 import { PassThrough } from 'stream';
 import { REST } from '@discordjs/rest';
 import { Routes } from 'discord-api-types/v10';
 
-// helpful crash logging
+// crash logging
 process.on('uncaughtException', (e) => { console.error('UNCAUGHT', e); process.exit(1); });
 process.on('unhandledRejection', (e) => { console.error('UNHANDLED', e); process.exit(1); });
 console.log('BOOT: starting server.js');
@@ -45,7 +47,7 @@ app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.get('/', (_req, res) => res.status(200).send('alive'));
 app.listen(Number(PORT), '0.0.0.0', () => log.info(`HTTP up on :${PORT} (/health)`));
 
-// Quick env diagnostics (no secrets printed)
+// Env diagnostics
 log.info({
   has_DISCORD_TOKEN: Boolean(DISCORD_TOKEN),
   has_APP_ID: Boolean(APP_ID),
@@ -88,8 +90,10 @@ const BYTES_PER_MS = 16000 * 2 / 1000;
 const chunkBytes = Math.max(10, Math.min(60, Number(CHUNK_MS))) * BYTES_PER_MS;
 
 let ws = null;
+let wantWs = false;
 let nextExpectedEventId = 1;
 const pendingAudio = new Map();
+let currentTargetUserId = null;
 
 async function getSignedUrl() {
   const url = `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${encodeURIComponent(ELEVEN_AGENT_ID)}`;
@@ -99,15 +103,29 @@ async function getSignedUrl() {
 }
 
 async function connectElevenWS() {
-  if (ws) return;
+  if (ws || wantWs) return;
+  wantWs = true;
+
   const url = (USE_SIGNED_URL === 'true')
     ? await getSignedUrl()
     : `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${encodeURIComponent(ELEVEN_AGENT_ID)}`;
+
   ws = new WebSocket(url);
   ws.on('open', () => {
     log.info('Agent WS connected');
+    // initial hello
     ws.send(JSON.stringify({ type: 'conversation_initiation_client_data' }));
+    // (NEW) declare our input format explicitly
+    ws.send(JSON.stringify({
+      type: 'session_update',
+      input_audio_format: {
+        encoding: 'pcm_s16le',
+        sample_rate_hz: 16000,
+        channels: 1
+      }
+    }));
   });
+
   ws.on('message', (raw) => {
     try {
       const data = JSON.parse(raw.toString());
@@ -116,6 +134,7 @@ async function connectElevenWS() {
         return;
       }
       if (data.type === 'audio') {
+        // Optional debug: console.log('audio evt', data.audio_event.event_id);
         const buf = Buffer.from(data.audio_event.audio_base_64, 'base64');
         pendingAudio.set(data.audio_event.event_id, buf);
         while (pendingAudio.has(nextExpectedEventId)) {
@@ -126,13 +145,30 @@ async function connectElevenWS() {
       }
     } catch {/* ignore non-JSON */}
   });
-  ws.on('close', () => { log.warn('Agent WS closed'); ws = null; nextExpectedEventId = 1; pendingAudio.clear(); });
-  ws.on('error', (err) => log.error({ err }, 'Agent WS error'));
+
+  ws.on('close', () => {
+    console.warn('Agent WS closed');
+    ws = null;
+    nextExpectedEventId = 1;
+    pendingAudio.clear();
+    if (wantWs && connection) {
+      setTimeout(() => connectElevenWS().catch(() => {}), 1500);
+    }
+  });
+
+  ws.on('error', (err) => console.error('Agent WS error', err));
 }
 
 function sendUserAudioChunk(buf) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ user_audio_chunk: buf.toString('base64') }));
+  }
+}
+
+// (NEW) signal end of user utterance so the agent replies
+function sendUserAudioEnd() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ user_audio_end: true }));
   }
 }
 
@@ -163,20 +199,27 @@ async function joinVoice(guild, voiceChannel) {
     channelId: voiceChannel.id,
     guildId: guild.id,
     adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf: false,   // ensure the bot can hear the channel
-    selfMute: false    // ensure the bot can speak
+    selfDeaf: false,
+    selfMute: false
   });
   connection.subscribe(ensureAudioPlayer());
+  watchVoiceConnection(connection, guild, voiceChannel);
 }
 
 function leaveVoice() {
   if (connection) { try { connection.destroy(); } catch {} connection = null; }
+  wantWs = false;
   if (ws) { try { ws.close(); } catch {} ws = null; }
 }
 
 function listenToUser(userId) {
   if (!connection) return;
-  const opusStream = connection.receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: 800 } });
+  currentTargetUserId = userId;
+
+  const opusStream = connection.receiver.subscribe(userId, {
+    end: { behavior: EndBehaviorType.AfterSilence, duration: 800 }
+  });
+
   const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
   const downsampler = new prism.FFmpeg({
     args: [
@@ -186,6 +229,7 @@ function listenToUser(userId) {
       'pipe:1'
     ]
   });
+
   opusStream.pipe(decoder).pipe(downsampler);
 
   let sendBuffer = Buffer.alloc(0);
@@ -196,10 +240,62 @@ function listenToUser(userId) {
       sendBuffer = sendBuffer.subarray(chunkBytes);
     }
   });
-  downsampler.on('end', () => { if (sendBuffer.length) sendUserAudioChunk(sendBuffer); });
+
+  downsampler.on('end', () => {
+    if (sendBuffer.length) sendUserAudioChunk(sendBuffer);
+    sendUserAudioEnd(); // <-- important: announce utterance end so agent responds
+  });
 }
 
-// ---- Slash command handling (only works if logged in) ----
+// ---- Voice connection watchdog (auto-rejoin) ----
+const vcRetry = new Map();
+async function watchVoiceConnection(conn, guild, channel) {
+  const key = guild.id;
+  vcRetry.set(key, 0);
+
+  conn.on('stateChange', async (oldState, newState) => {
+    console.log(`VOICE state: ${oldState.status} -> ${newState.status}`);
+
+    if (newState.status === VoiceConnectionStatus.Disconnected) {
+      const attempts = (vcRetry.get(key) || 0) + 1;
+      vcRetry.set(key, attempts);
+
+      try {
+        await Promise.race([
+          entersState(conn, VoiceConnectionStatus.Signalling, 5_000),
+          entersState(conn, VoiceConnectionStatus.Connecting, 5_000)
+        ]);
+        vcRetry.set(key, 0);
+        return;
+      } catch {/* fall through */}
+      const backoff = Math.min(30_000, 1000 * Math.pow(2, attempts));
+      console.warn(`Voice disconnected; rejoining in ${backoff}ms (attempt ${attempts})`);
+      setTimeout(async () => {
+        try {
+          await joinVoice(guild, channel);
+          if (connection) watchVoiceConnection(connection, guild, channel);
+          if (currentTargetUserId) listenToUser(currentTargetUserId);
+        } catch (e) { console.error('Rejoin failed:', e); }
+      }, backoff);
+    }
+
+    if (newState.status === VoiceConnectionStatus.Destroyed) {
+      console.warn('Voice connection destroyed');
+      vcRetry.delete(key);
+    }
+  });
+
+  const networkStateChangeHandler = (oldNetworkState, newNetworkState) => {
+    const newUdp = Reflect.get(newNetworkState, 'udp');
+    clearInterval(newUdp?.keepAliveInterval);
+  };
+  conn.on('stateChange', (oldState, newState) => {
+    Reflect.get(oldState, 'networking')?.off('stateChange', networkStateChangeHandler);
+    Reflect.get(newState, 'networking')?.on('stateChange', networkStateChangeHandler);
+  });
+}
+
+// ---- Slash command handling ----
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   try {
@@ -218,7 +314,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.deferReply({ ephemeral: true });
       await joinVoice(interaction.guild, voice);
 
-      // extra safety: undeafen / unmute the bot’s member after joining
+      // undeafen / unmute the bot’s member after joining
       try {
         const me = await interaction.guild.members.fetchMe();
         if (me?.voice) {
@@ -235,6 +331,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.editReply('Missing ELEVEN_API_KEY (signed URL mode). Set it in Railway Variables.');
         return;
       }
+
       await connectElevenWS();
       listenToUser(interaction.user.id);
       await interaction.editReply('Joined VC and listening to you.');
