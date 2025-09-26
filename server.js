@@ -1,9 +1,10 @@
-// server.js (safe boot, realtime, with debug + /dao-beep, StreamType.Opus)
+// server.js (ffmpeg-static wired, safe boot, realtime, debug, /dao-beep)
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
 import WebSocket from 'ws';
 import pino from 'pino';
+import ffmpegPath from 'ffmpeg-static';
 import {
   Client, GatewayIntentBits, Partials, Events, ChannelType, PermissionsBitField
 } from 'discord.js';
@@ -61,7 +62,7 @@ const client = new Client({
   partials: [Partials.GuildMember]
 });
 
-// ---- Slash Command Auto-Registration (adds /dao-beep) ----
+// ---- Slash Command Auto-Registration (/dao-beep included) ----
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
   const commands = [
@@ -86,20 +87,26 @@ async function registerCommands() {
 // ---- Discord Voice + ElevenLabs bridge ----
 let connection = null;
 let audioPlayer = null;
+let shouldStayInVC = false;
+
 const playbackPCM = new PassThrough({ highWaterMark: 1 << 24 });
 const BYTES_PER_MS = 16000 * 2 / 1000;
 const chunkBytes = Math.max(10, Math.min(60, Number(CHUNK_MS))) * BYTES_PER_MS;
 
 // encoder: PCM16k mono -> Opus 48k stereo for Discord
 function pcmToDiscordOpus() {
-  return new prism.FFmpeg({
+  const ff = new prism.FFmpeg({
+    command: ffmpegPath,
     args: [
       '-f', 's16le', '-ar', '16000', '-ac', '1',
       '-i', 'pipe:0',
       '-ac', '2', '-ar', '48000',
+      // raw Opus RTP-ish packets are fine for discord.js voice resource
       '-f', 'opus', 'pipe:1'
     ]
   });
+  ff.on('error', (e) => console.error('opusEncoder ffmpeg error:', e));
+  return ff;
 }
 const opusEncoder = pcmToDiscordOpus();
 playbackPCM.pipe(opusEncoder);
@@ -127,6 +134,7 @@ function playBeep() {
 }
 
 async function joinVoice(guild, voiceChannel) {
+  shouldStayInVC = true;
   connection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId: guild.id,
@@ -139,6 +147,7 @@ async function joinVoice(guild, voiceChannel) {
 }
 
 function leaveVoice() {
+  shouldStayInVC = false;
   if (connection) { try { connection.destroy(); } catch {} connection = null; }
   wantWs = false;
   if (ws) { try { ws.close(); } catch {} ws = null; }
@@ -159,9 +168,13 @@ function listenToUser(userId) {
 
   // DEBUG: confirm incoming mic Opus packets
   opusStream.on('data', (c) => console.log('opus chunk', c.length));
+  opusStream.on('error', (e) => console.error('opusStream error:', e));
 
   const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+  decoder.on('error', (e) => console.error('opus decoder error:', e));
+
   const downsampler = new prism.FFmpeg({
+    command: ffmpegPath,
     args: [
       '-f', 's16le', '-ar', '48000', '-ac', '2',
       '-i', 'pipe:0',
@@ -169,6 +182,7 @@ function listenToUser(userId) {
       'pipe:1'
     ]
   });
+  downsampler.on('error', (e) => console.error('downsampler ffmpeg error:', e));
 
   opusStream.pipe(decoder).pipe(downsampler);
 
@@ -188,7 +202,7 @@ function listenToUser(userId) {
   });
 }
 
-// ---- Voice connection watchdog (auto-rejoin) ----
+// ---- Voice connection watchdog (auto-rejoin unless kicked) ----
 const vcRetry = new Map();
 async function watchVoiceConnection(conn, guild, channel) {
   const key = guild.id;
@@ -198,6 +212,10 @@ async function watchVoiceConnection(conn, guild, channel) {
     console.log(`VOICE state: ${oldState.status} -> ${newState.status}`);
 
     if (newState.status === VoiceConnectionStatus.Disconnected) {
+      if (!shouldStayInVC) {
+        console.log('Bot was removed/kicked, not rejoining.');
+        return;
+      }
       const attempts = (vcRetry.get(key) || 0) + 1;
       vcRetry.set(key, attempts);
       try {
