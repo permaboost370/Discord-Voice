@@ -1,5 +1,5 @@
 // server.js — Discord <-> ElevenLabs realtime bridge
-// Stable playback: pipeline created once on join. VAD mic capture + /dao-say. Handles audio.delta & legacy audio.
+// Stable playback via raw Opus frames (no Ogg). VAD mic capture + /dao-say. Handles audio.delta & legacy audio.
 
 import 'dotenv/config';
 import express from 'express';
@@ -24,7 +24,7 @@ import { PassThrough } from 'stream';
 import { REST } from '@discordjs/rest';
 import { Routes } from 'discord-api-types/v10';
 
-// --- crash logging (keep alive for /health) ---
+// --- crash logging ---
 process.on('uncaughtException', (e) => console.error('UNCAUGHT', e));
 process.on('unhandledRejection', (e) => console.error('UNHANDLED', e));
 console.log('BOOT: starting server.js');
@@ -44,7 +44,7 @@ const {
   CHUNK_MS = '20',
   VAD_THRESHOLD = '800',
   VAD_HANG_MS = '300',
-  IDLE_CLOSE_MS = '120000'    // generous while testing
+  IDLE_CLOSE_MS = '120000'
 } = process.env;
 
 const log = pino({ level: LOG_LEVEL });
@@ -81,32 +81,46 @@ async function registerCommands() {
 // ---------------- Playback chain (created once on join) ----------------
 let connection = null;
 let audioPlayer = null;
-let oggOpus = null;
 
 // Long-lived PCM16k source we write agent audio into
 const playbackPCM16k = new PassThrough({ highWaterMark: 1 << 24 });
 
-function createTranscoder() {
+// Resample 16k mono PCM → 48k stereo PCM (Discord-native) via ffmpeg
+function createResampler16kTo48kStereo() {
   const ff = new prism.FFmpeg({
     command: ffmpegPath,
     args: [
       '-f', 's16le', '-ar', '16000', '-ac', '1',
       '-i', 'pipe:0',
-      '-ar', '48000', '-ac', '2',
-      '-c:a', 'libopus', '-b:a', '64k',
-      '-f', 'ogg', 'pipe:1'
+      '-f', 's16le', '-ar', '48000', '-ac', '2',
+      'pipe:1'
     ]
   });
-  ff.on('error', (e) => console.error('ffmpeg ogg error:', e));
+  ff.on('error', (e) => console.error('ffmpeg resample (16k→48k) error:', e));
   return ff;
 }
 
-function ensurePlaybackPipelineOnce() {
-  if (audioPlayer && oggOpus) return;
+// Encode 48k stereo PCM → raw Opus frames
+function createOpusEncoder() {
+  const enc = new prism.opus.Encoder({ rate: 48000, channels: 2, frameSize: 960 });
+  enc.on('error', (e) => console.error('Opus encoder error:', e));
+  return enc;
+}
 
-  if (!oggOpus) {
-    oggOpus = createTranscoder();
-    playbackPCM16k.pipe(oggOpus);
+let resampler = null;
+let opusEncoder = null;
+
+function ensurePlaybackPipelineOnce() {
+  if (audioPlayer && resampler && opusEncoder) return;
+
+  if (!resampler) {
+    resampler = createResampler16kTo48kStereo();
+    playbackPCM16k.pipe(resampler);
+  }
+
+  if (!opusEncoder) {
+    opusEncoder = createOpusEncoder();
+    resampler.pipe(opusEncoder);
   }
 
   if (!audioPlayer) {
@@ -116,9 +130,9 @@ function ensurePlaybackPipelineOnce() {
     audioPlayer.on(AudioPlayerStatus.Idle,    () => log.info('AudioPlayer: idle'));
   }
 
-  const resource = createAudioResource(oggOpus, { inputType: StreamType.OggOpus });
+  const resource = createAudioResource(opusEncoder, { inputType: StreamType.Opus });
   audioPlayer.play(resource);
-  log.info('Playback pipeline ready (PCM16k -> OggOpus -> player)');
+  log.info('Playback pipeline ready (PCM16k → 48k PCM → Opus frames → player)');
 }
 
 function playBeep() {
@@ -167,7 +181,6 @@ async function connectElevenWS() {
     log.info('Agent WS connected');
     resetIdleTimer();
 
-    // DO NOT rebuild playback pipeline here; it's already created on join
     ws.send(JSON.stringify({ type: 'conversation_initiation_client_data' }));
     const sessionPayload = {
       type: 'session.update',
@@ -192,19 +205,19 @@ async function connectElevenWS() {
         return;
       }
 
-      // Legacy single-chunk audio
+      // Legacy single-chunk audio (PCM16k mono, base64)
       if (msg.type === 'audio' && msg.audio_event?.audio_base_64) {
         resetIdleTimer();
-        const buf = Buffer.from(msg.audio_event.audio_base_64, 'base64'); // 16k mono PCM
+        const buf = Buffer.from(msg.audio_event.audio_base_64, 'base64');
         const ok = playbackPCM16k.write(buf);
         console.log('↓ audio (legacy)', buf.length, 'bytes', 'writeOK=', ok);
         return;
       }
 
-      // Streaming audio
+      // Streaming audio (PCM16k mono)
       if (msg.type === 'audio.delta' && msg.delta) {
         resetIdleTimer();
-        const buf = Buffer.from(msg.delta, 'base64'); // 16k mono PCM
+        const buf = Buffer.from(msg.delta, 'base64');
         const ok = playbackPCM16k.write(buf);
         console.log('↓ audio.delta', buf.length, 'bytes', 'writeOK=', ok);
         return;
@@ -212,7 +225,7 @@ async function connectElevenWS() {
 
       if (msg.type === 'audio.end') { console.log('↓ audio.end'); return; }
 
-      // See other events/errors
+      // Log everything else (errors, text, etc.)
       try {
         const preview = JSON.stringify(msg);
         console.log('WS EVENT', msg.type, preview.length > 500 ? preview.slice(0, 500) + '…' : preview);
@@ -336,7 +349,7 @@ async function joinVoice(guild, voiceChannel) {
     selfMute: false
   });
 
-  ensurePlaybackPipelineOnce(); // build once here
+  ensurePlaybackPipelineOnce(); // build once
 
   const sub = connection.subscribe(audioPlayer);
   log.info('Subscribed to audioPlayer', { sub: !!sub });
