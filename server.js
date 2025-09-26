@@ -1,4 +1,4 @@
-// server.js (safe boot, realtime, with debug + /dao-beep)
+// server.js (safe boot, realtime, with debug + /dao-beep, StreamType.Opus)
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
@@ -108,7 +108,8 @@ function ensureAudioPlayer() {
   if (audioPlayer) return audioPlayer;
   audioPlayer = createAudioPlayer();
   audioPlayer.on(AudioPlayerStatus.Idle, () => {});
-  const resource = createAudioResource(opusEncoder, { inputType: StreamType.OggOpus });
+  // IMPORTANT: we’re feeding RAW Opus packets, not Ogg
+  const resource = createAudioResource(opusEncoder, { inputType: StreamType.Opus });
   audioPlayer.play(resource);
   return audioPlayer;
 }
@@ -155,6 +156,9 @@ function listenToUser(userId) {
   const opusStream = connection.receiver.subscribe(userId, {
     end: { behavior: EndBehaviorType.AfterSilence, duration: 800 }
   });
+
+  // DEBUG: confirm incoming mic Opus packets
+  opusStream.on('data', (c) => console.log('opus chunk', c.length));
 
   const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
   const downsampler = new prism.FFmpeg({
