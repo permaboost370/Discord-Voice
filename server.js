@@ -1,3 +1,4 @@
+// server.js
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
@@ -30,9 +31,7 @@ const {
   CHUNK_MS = '20'
 } = process.env;
 
-if (!DISCORD_TOKEN || !APP_ID || !GUILD_ID) {
-  throw new Error('Missing DISCORD_TOKEN, APP_ID, or GUILD_ID');
-}
+if (!DISCORD_TOKEN || !APP_ID || !GUILD_ID) throw new Error('Missing DISCORD_TOKEN, APP_ID, or GUILD_ID');
 if (!ELEVEN_AGENT_ID) throw new Error('Missing ELEVEN_AGENT_ID');
 
 const log = pino({ level: LOG_LEVEL });
@@ -68,7 +67,6 @@ async function registerCommands() {
 // ----- Discord Voice + ElevenLabs Bridge -----
 let connection = null;
 let audioPlayer = null;
-let targetUserId = null;
 
 const playbackPCM = new PassThrough({ highWaterMark: 1 << 24 });
 const BYTES_PER_MS = 16000 * 2 / 1000;
@@ -170,10 +168,11 @@ function leaveVoice() {
 
 function listenToUser(userId) {
   if (!connection) return;
-  targetUserId = userId;
+
   const opusStream = connection.receiver.subscribe(userId, {
     end: { behavior: EndBehaviorType.AfterSilence, duration: 800 }
   });
+
   const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
   const downsampler = new prism.FFmpeg({
     args: [
@@ -183,6 +182,7 @@ function listenToUser(userId) {
       'pipe:1'
     ]
   });
+
   opusStream.pipe(decoder).pipe(downsampler);
 
   let sendBuffer = Buffer.alloc(0);
@@ -205,6 +205,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const voice = member.voice?.channel;
       if (!voice || voice.type !== ChannelType.GuildVoice) {
         await interaction.reply({ content: 'Join a voice channel first.', ephemeral: true });
+        return;
+      }
+      const perms = voice.permissionsFor(interaction.guild.members.me);
+      if (!perms?.has(PermissionsBitField.Flags.Connect) || !perms?.has(PermissionsBitField.Flags.Speak)) {
+        await interaction.reply({ content: 'I need Connect & Speak permissions in that channel.', ephemeral: true });
         return;
       }
       await interaction.deferReply({ ephemeral: true });
@@ -259,4 +264,4 @@ client.once(Events.ClientReady, () => log.info(`Logged in as ${client.user.tag}`
   await registerCommands();
   await client.login(DISCORD_TOKEN);
 })();
-app.listen(PORT, () => log.info(`HTTP up on :${PORT} (/health)`));
+app.listen(Number(PORT), () => log.info(`HTTP up on :${PORT} (/health)`));
