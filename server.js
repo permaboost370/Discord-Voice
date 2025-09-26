@@ -1,4 +1,4 @@
-// server.js
+// server.js (safe boot)
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
@@ -31,19 +31,29 @@ const {
   CHUNK_MS = '20'
 } = process.env;
 
-if (!DISCORD_TOKEN || !APP_ID || !GUILD_ID) throw new Error('Missing DISCORD_TOKEN, APP_ID, or GUILD_ID');
-if (!ELEVEN_AGENT_ID) throw new Error('Missing ELEVEN_AGENT_ID');
-
 const log = pino({ level: LOG_LEVEL });
+
+// --- Express up FIRST so /health always works ---
 const app = express();
 app.get('/health', (_req, res) => res.status(200).send('ok'));
+app.get('/', (_req, res) => res.status(200).send('alive'));
+app.listen(Number(PORT), () => log.info(`HTTP up on :${PORT} (/health)`));
+
+// Quick env diagnostics (no secrets printed)
+log.info({
+  has_DISCORD_TOKEN: Boolean(DISCORD_TOKEN),
+  has_APP_ID: Boolean(APP_ID),
+  has_GUILD_ID: Boolean(GUILD_ID),
+  has_ELEVEN_AGENT_ID: Boolean(ELEVEN_AGENT_ID),
+  use_signed_url: USE_SIGNED_URL
+}, 'Env check');
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
   partials: [Partials.GuildMember]
 });
 
-// ----- Slash Command Auto-Registration -----
+// ---- Slash Command Auto-Registration (only if envs exist) ----
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
   const commands = [
@@ -64,15 +74,13 @@ async function registerCommands() {
   log.info('Slash commands registered');
 }
 
-// ----- Discord Voice + ElevenLabs Bridge -----
+// ---- Discord Voice + ElevenLabs bridge ----
 let connection = null;
 let audioPlayer = null;
-
 const playbackPCM = new PassThrough({ highWaterMark: 1 << 24 });
 const BYTES_PER_MS = 16000 * 2 / 1000;
 const chunkBytes = Math.max(10, Math.min(60, Number(CHUNK_MS))) * BYTES_PER_MS;
 
-// ElevenLabs WS
 let ws = null;
 let nextExpectedEventId = 1;
 const pendingAudio = new Map();
@@ -90,12 +98,10 @@ async function connectElevenWS() {
     ? await getSignedUrl()
     : `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${encodeURIComponent(ELEVEN_AGENT_ID)}`;
   ws = new WebSocket(url);
-
   ws.on('open', () => {
     log.info('Agent WS connected');
     ws.send(JSON.stringify({ type: 'conversation_initiation_client_data' }));
   });
-
   ws.on('message', (raw) => {
     try {
       const data = JSON.parse(raw.toString());
@@ -104,24 +110,18 @@ async function connectElevenWS() {
         return;
       }
       if (data.type === 'audio') {
-        const { audio_event } = data;
-        const buf = Buffer.from(audio_event.audio_base_64, 'base64');
-        pendingAudio.set(audio_event.event_id, buf);
+        const buf = Buffer.from(data.audio_event.audio_base_64, 'base64');
+        pendingAudio.set(data.audio_event.event_id, buf);
         while (pendingAudio.has(nextExpectedEventId)) {
           playbackPCM.write(pendingAudio.get(nextExpectedEventId));
           pendingAudio.delete(nextExpectedEventId);
           nextExpectedEventId++;
         }
       }
-    } catch { /* ignore non-JSON */ }
+    } catch {/* ignore non-JSON */}
   });
-
-  ws.on('close', () => {
-    log.warn('Agent WS closed');
-    ws = null;
-    nextExpectedEventId = 1;
-    pendingAudio.clear();
-  });
+  ws.on('close', () => { log.warn('Agent WS closed'); ws = null; nextExpectedEventId = 1; pendingAudio.clear(); });
+  ws.on('error', (err) => log.error({ err }, 'Agent WS error'));
 }
 
 function sendUserAudioChunk(buf) {
@@ -168,11 +168,7 @@ function leaveVoice() {
 
 function listenToUser(userId) {
   if (!connection) return;
-
-  const opusStream = connection.receiver.subscribe(userId, {
-    end: { behavior: EndBehaviorType.AfterSilence, duration: 800 }
-  });
-
+  const opusStream = connection.receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: 800 } });
   const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
   const downsampler = new prism.FFmpeg({
     args: [
@@ -182,7 +178,6 @@ function listenToUser(userId) {
       'pipe:1'
     ]
   });
-
   opusStream.pipe(decoder).pipe(downsampler);
 
   let sendBuffer = Buffer.alloc(0);
@@ -196,7 +191,7 @@ function listenToUser(userId) {
   downsampler.on('end', () => { if (sendBuffer.length) sendUserAudioChunk(sendBuffer); });
 }
 
-// ----- Command Handling -----
+// ---- Slash command handling (only works if logged in) ----
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   try {
@@ -214,6 +209,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       await interaction.deferReply({ ephemeral: true });
       await joinVoice(interaction.guild, voice);
+      if (!ELEVEN_AGENT_ID) {
+        await interaction.editReply('Missing ELEVEN_AGENT_ID. Set it in Railway Variables.');
+        return;
+      }
+      if (USE_SIGNED_URL === 'true' && !ELEVEN_API_KEY) {
+        await interaction.editReply('Missing ELEVEN_API_KEY (signed URL mode). Set it in Railway Variables.');
+        return;
+      }
       await connectElevenWS();
       listenToUser(interaction.user.id);
       await interaction.editReply('Joined VC and listening to you.');
@@ -250,18 +253,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   } catch (err) {
     log.error(err);
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply('Error. Check logs.');
-    } else {
-      await interaction.reply({ content: 'Error. Check logs.', ephemeral: true });
-    }
+    if (interaction.deferred || interaction.replied) { await interaction.editReply('Error. Check logs.'); }
+    else { await interaction.reply({ content: 'Error. Check logs.', ephemeral: true }); }
   }
 });
 
-// ----- Startup -----
-client.once(Events.ClientReady, () => log.info(`Logged in as ${client.user.tag}`));
+// ---- Start bot only if the three core Discord vars exist ----
 (async () => {
-  await registerCommands();
-  await client.login(DISCORD_TOKEN);
+  if (DISCORD_TOKEN && APP_ID && GUILD_ID) {
+    try {
+      await registerCommands();
+      await client.login(DISCORD_TOKEN);
+      log.info('Discord bot logged in');
+    } catch (e) {
+      console.error('Discord startup failed:', e?.message || e);
+    }
+  } else {
+    console.warn('⏭️ Skipping Discord login (missing DISCORD_TOKEN or APP_ID or GUILD_ID). /health still OK.');
+  }
 })();
-app.listen(Number(PORT), () => log.info(`HTTP up on :${PORT} (/health)`));
