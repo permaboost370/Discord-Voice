@@ -211,10 +211,20 @@ function rms(buf) {
   return Math.sqrt(mean);
 }
 
+let activeOpusPipeline = null;
+function cleanupOpusPipeline() {
+  try { activeOpusPipeline?.opusStream?.destroy(); } catch {}
+  try { activeOpusPipeline?.decoder?.destroy(); } catch {}
+  try { activeOpusPipeline?.downsampler?.destroy(); } catch {}
+  activeOpusPipeline = null;
+}
+
 function listenToUser(userId) {
   if (!connection) return;
   currentTargetUserId = userId;
   console.log('listenToUser ->', userId);
+
+  cleanupOpusPipeline();
 
   const opusStream = connection.receiver.subscribe(userId, {
     end: { behavior: EndBehaviorType.AfterSilence, duration: 800 }
@@ -242,6 +252,8 @@ function listenToUser(userId) {
   downsampler.on('error', (e) => console.error('downsampler ffmpeg error:', e));
 
   opusStream.pipe(decoder).pipe(downsampler);
+
+  activeOpusPipeline = { opusStream, decoder, downsampler };
 
   let sendBuffer = Buffer.alloc(0);
   let vadTalking = false;
@@ -357,27 +369,52 @@ async function connectElevenWS() {
   ws.on('open', () => {
     log.info('Agent WS connected');
     resetIdleTimer();
+
+    // optional metadata stub; harmless if ignored
     ws.send(JSON.stringify({ type: 'conversation_initiation_client_data' }));
+
+    // IMPORTANT: event name uses dot-case and nests a "session" object
     ws.send(JSON.stringify({
-      type: 'session_update',
-      input_audio_format: { encoding: 'pcm_s16le', sample_rate_hz: 16000, channels: 1 }
+      type: 'session.update',
+      session: {
+        input_audio_format: { encoding: 'pcm_s16le', sample_rate_hz: 16000, channels: 1 },
+        output_audio_format: { encoding: 'pcm_s16le', sample_rate_hz: 16000, channels: 1 }
+      }
     }));
   });
 
   ws.on('message', (raw) => {
     try {
-      const data = JSON.parse(raw.toString());
-      if (data.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong', event_id: data.ping_event.event_id }));
+      const msg = JSON.parse(raw.toString());
+
+      if (msg.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong', event_id: msg.ping_event?.event_id }));
         return;
       }
-      if (data.type === 'audio') {
+
+      // ElevenLabs realtime responds with incremental audio
+      if (msg.type === 'audio.delta' && msg.delta) {
         resetIdleTimer();
-        // agent audio is PCM 16k mono; feed to playback
-        const buf = Buffer.from(data.audio_event.audio_base_64, 'base64');
-        playbackPCM16k.write(buf);
+        const buf = Buffer.from(msg.delta, 'base64'); // 16k mono PCM
+        // backpressure-friendly write
+        if (!playbackPCM16k.write(buf)) {
+          playbackPCM16k.once('drain', () => {});
+        }
+        return;
       }
-    } catch { /* ignore */ }
+
+      // Optional end-of-utterance marker
+      if (msg.type === 'audio.end') {
+        // clip boundary hook (no-op)
+        return;
+      }
+
+      // Helpful debug for unexpected events (comment out to reduce noise)
+      // if (!['session.updated','response.created'].includes(msg.type)) console.log('WS EVENT', msg.type);
+
+    } catch (e) {
+      console.error('WS parse error', e);
+    }
   });
 
   ws.on('close', () => {
@@ -392,14 +429,19 @@ async function connectElevenWS() {
   ws.on('error', (err) => console.error('Agent WS error', err));
 }
 
+// >>> CORRECT realtime send API: append -> commit -> response.create
 function sendUserAudioChunk(buf) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ user_audio_chunk: buf.toString('base64') }));
+    ws.send(JSON.stringify({
+      type: 'input_audio_buffer.append',
+      audio: buf.toString('base64') // raw PCM 16k mono
+    }));
   }
 }
 function sendUserAudioEnd() {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ user_audio_end: true }));
+    ws.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
+    ws.send(JSON.stringify({ type: 'response.create' }));
   }
 }
 
