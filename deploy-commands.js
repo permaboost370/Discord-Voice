@@ -1,11 +1,8 @@
 import 'dotenv/config';
-import { REST, Routes } from '@discordjs/rest';
+import { REST } from '@discordjs/rest';
+import { Routes } from 'discord-api-types/v10';
 
-const {
-  DISCORD_TOKEN,
-  APP_ID,
-  GUILD_ID
-} = process.env;
+const { DISCORD_TOKEN, APP_ID, GUILD_ID } = process.env;
 
 if (!DISCORD_TOKEN || !APP_ID || !GUILD_ID) {
   throw new Error('DISCORD_TOKEN, APP_ID, and GUILD_ID are required to deploy commands.');
@@ -14,11 +11,11 @@ if (!DISCORD_TOKEN || !APP_ID || !GUILD_ID) {
 const commands = [
   {
     name: 'dao-join',
-    description: 'Join your current voice channel and start realtime with ElevenLabs.',
+    description: 'Join your current voice channel and start realtime with ElevenLabs.'
   },
   {
     name: 'dao-leave',
-    description: 'Leave the voice channel and end the session.',
+    description: 'Leave the voice channel and end the session.'
   },
   {
     name: 'dao-context',
@@ -41,6 +38,26 @@ const commands = [
         description: 'User to target',
         type: 6, // USER
         required: true
+      }
+    ]
+  },
+  {
+    name: 'dao-beep',
+    description: 'Play a 1s test beep to verify playback.'
+  },
+  {
+    name: 'dao-brief',
+    description: 'Toggle brief replies to save credits.',
+    options: [
+      {
+        name: 'mode',
+        description: 'on/off',
+        type: 3, // STRING
+        required: true,
+        choices: [
+          { name: 'on', value: 'on' },
+          { name: 'off', value: 'off' }
+        ]
       }
     ]
   }
