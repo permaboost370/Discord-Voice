@@ -1,4 +1,6 @@
-// server.js — stable playback via prism.opus.Encoder, VAD + idle-close, /dao-beep
+// server.js — Discord <-> ElevenLabs realtime bridge
+// Playback via Ogg/Opus (ffmpeg-static), VAD gating, idle-close, /dao-beep, /dao-brief
+
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
@@ -40,10 +42,10 @@ const {
   PORT = 8080,
   LOG_LEVEL = 'info',
   CHUNK_MS = '20',
-  // cost controls (defaults are credit-friendly already)
-  VAD_THRESHOLD = '800',      // lower than before to ensure trigger
-  VAD_HANG_MS = '300',
-  IDLE_CLOSE_MS = '45000'
+  // credit controls (defaults are credit-friendly)
+  VAD_THRESHOLD = '800',      // raise if background noise triggers; lower if it misses your voice
+  VAD_HANG_MS = '300',        // keep streaming this long after last loud sample (ms)
+  IDLE_CLOSE_MS = '45000'     // close Eleven WS after this idle (ms)
 } = process.env;
 
 const log = pino({ level: LOG_LEVEL });
@@ -98,56 +100,51 @@ async function registerCommands() {
   log.info('Slash commands registered');
 }
 
-// ---------------- Playback chain (agent PCM16k → resample 48k → Opus) ----------------
+// ---------------- Playback chain (agent PCM16k -> Ogg/Opus) ----------------
 let connection = null;
 let audioPlayer = null;
 let shouldStayInVC = false;
 
-// agent writes 16k mono PCM here
+// agent PCM (16k mono) is written here (also where /dao-beep writes)
 const playbackPCM16k = new PassThrough({ highWaterMark: 1 << 24 });
 
-// ffmpeg: 16k mono → 48k stereo PCM
-function resample16kTo48k() {
+// Create an Ogg/Opus stream from PCM16k using ffmpeg-static
+function pcm16kToOggOpus() {
   const ff = new prism.FFmpeg({
     command: ffmpegPath,
     args: [
-      '-f', 's16le', '-ar', '16000', '-ac', '1', // input
+      // input: raw PCM S16LE 16k mono
+      '-f', 's16le', '-ar', '16000', '-ac', '1',
       '-i', 'pipe:0',
-      '-f', 's16le', '-ar', '48000', '-ac', '2', // output
+      // output: Ogg/Opus at 48k stereo (Discord-native)
+      '-ar', '48000',
+      '-ac', '2',
+      '-c:a', 'libopus',
+      '-b:a', '64k',
+      '-f', 'ogg',
       'pipe:1'
     ]
   });
   ff.on('spawn', () => {
-    try { ff.process.stderr.on('data', d => console.error('[ffmpeg resample]', d.toString())); } catch {}
+    try { ff.process.stderr.on('data', d => console.error('[ffmpeg ogg]', d.toString())); } catch {}
   });
-  ff.on('error', (e) => console.error('ffmpeg resample error:', e));
+  ff.on('error', (e) => console.error('ffmpeg ogg error:', e));
   return ff;
 }
-
-const resampler = resample16kTo48k();
-
-// prism’s Opus encoder (stable)
-const opusEncoder = new prism.opus.Encoder({
-  rate: 48000,
-  channels: 2,
-  frameSize: 960
-});
-opusEncoder.on('error', (e) => console.error('opusEncoder error:', e));
-
-// wiring: agent 16k PCM -> resampler -> encoder -> audio resource
-playbackPCM16k.pipe(resampler).pipe(opusEncoder);
+const oggOpus = pcm16kToOggOpus();
+playbackPCM16k.pipe(oggOpus);
 
 function ensureAudioPlayer() {
   if (audioPlayer) return audioPlayer;
   audioPlayer = createAudioPlayer({
-    behaviors: { noSubscriber: NoSubscriberBehavior.Play } // don't auto-stop, keeps resource hot
+    behaviors: { noSubscriber: NoSubscriberBehavior.Play }
   });
   audioPlayer.on('error', (e) => console.error('AudioPlayer error:', e));
   audioPlayer.on(AudioPlayerStatus.Playing, () => log.info('AudioPlayer: playing'));
   audioPlayer.on(AudioPlayerStatus.Idle, () => log.info('AudioPlayer: idle'));
 
-  // IMPORTANT: we’re feeding RAW Opus packets
-  const resource = createAudioResource(opusEncoder, { inputType: StreamType.Opus });
+  // IMPORTANT: we’re feeding Ogg/Opus
+  const resource = createAudioResource(oggOpus, { inputType: StreamType.OggOpus });
   audioPlayer.play(resource);
   return audioPlayer;
 }
@@ -194,9 +191,6 @@ const VAD_THRESH = Number(VAD_THRESHOLD);
 const VAD_HANG = Number(VAD_HANG_MS);
 
 let currentTargetUserId = null;
-let bytesSent = 0;
-let vadTalking = false;
-let vadLastVoiceAt = 0;
 let idleTimer = null;
 
 function resetIdleTimer() {
@@ -232,6 +226,7 @@ function listenToUser(userId) {
   const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
   decoder.on('error', (e) => console.error('opus decoder error:', e));
 
+  // downsample to 16k mono for ElevenLabs
   const downsampler = new prism.FFmpeg({
     command: ffmpegPath,
     args: [
@@ -249,8 +244,11 @@ function listenToUser(userId) {
   opusStream.pipe(decoder).pipe(downsampler);
 
   let sendBuffer = Buffer.alloc(0);
+  let vadTalking = false;
+  let vadLastVoiceAt = 0;
+
   downsampler.on('data', (chunk) => {
-    resetIdleTimer();
+    resetIdleTimer(); // activity
     const level = rms(chunk);
     const now = Date.now();
 
@@ -279,7 +277,6 @@ function listenToUser(userId) {
   downsampler.on('end', () => {
     if (sendBuffer.length) sendUserAudioChunk(sendBuffer);
     if (vadTalking) sendUserAudioEnd();
-    vadTalking = false;
   });
 }
 
@@ -376,9 +373,9 @@ async function connectElevenWS() {
       }
       if (data.type === 'audio') {
         resetIdleTimer();
-        const buf = Buffer.from(data.audio_event.audio_base_64, 'base64'); // PCM 16k mono
+        // agent audio is PCM 16k mono; feed to playback
+        const buf = Buffer.from(data.audio_event.audio_base_64, 'base64');
         playbackPCM16k.write(buf);
-        // console.log('audio evt', data.audio_event.event_id);
       }
     } catch { /* ignore */ }
   });
