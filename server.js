@@ -1,4 +1,4 @@
-// server.js (safe boot)
+// server.js (safe boot, corrected + undeafen on join)
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
@@ -162,7 +162,9 @@ async function joinVoice(guild, voiceChannel) {
   connection = joinVoiceChannel({
     channelId: voiceChannel.id,
     guildId: guild.id,
-    adapterCreator: guild.voiceAdapterCreator
+    adapterCreator: guild.voiceAdapterCreator,
+    selfDeaf: false,   // ensure the bot can hear the channel
+    selfMute: false    // ensure the bot can speak
   });
   connection.subscribe(ensureAudioPlayer());
 }
@@ -215,6 +217,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       await interaction.deferReply({ ephemeral: true });
       await joinVoice(interaction.guild, voice);
+
+      // extra safety: undeafen / unmute the bot’s member after joining
+      try {
+        const me = await interaction.guild.members.fetchMe();
+        if (me?.voice) {
+          await me.voice.setDeaf(false).catch(() => {});
+          await me.voice.setMute(false).catch(() => {});
+        }
+      } catch {}
+
       if (!ELEVEN_AGENT_ID) {
         await interaction.editReply('Missing ELEVEN_AGENT_ID. Set it in Railway Variables.');
         return;
