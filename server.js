@@ -17,7 +17,13 @@ import {
 } from '@discordjs/voice';
 import prism from 'prism-media';
 import { PassThrough } from 'stream';
-import { REST, Routes } from '@discordjs/rest';
+import { REST } from '@discordjs/rest';
+import { Routes } from 'discord-api-types/v10';
+
+// helpful crash logging
+process.on('uncaughtException', (e) => { console.error('UNCAUGHT', e); process.exit(1); });
+process.on('unhandledRejection', (e) => { console.error('UNHANDLED', e); process.exit(1); });
+console.log('BOOT: starting server.js');
 
 const {
   DISCORD_TOKEN,
@@ -37,7 +43,7 @@ const log = pino({ level: LOG_LEVEL });
 const app = express();
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.get('/', (_req, res) => res.status(200).send('alive'));
-app.listen(Number(PORT), () => log.info(`HTTP up on :${PORT} (/health)`));
+app.listen(Number(PORT), '0.0.0.0', () => log.info(`HTTP up on :${PORT} (/health)`));
 
 // Quick env diagnostics (no secrets printed)
 log.info({
