@@ -1,6 +1,4 @@
-// server.js — realtime Discord <-> ElevenLabs bridge
-// Stable playback, VAD gating, idle close, brief mode, safe boot.
-
+// server.js — stable playback via prism.opus.Encoder, VAD + idle-close, /dao-beep
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
@@ -18,14 +16,13 @@ import {
   EndBehaviorType,
   AudioPlayerStatus,
   VoiceConnectionStatus,
-  entersState
+  entersState,
+  NoSubscriberBehavior
 } from '@discordjs/voice';
 import prism from 'prism-media';
 import { PassThrough } from 'stream';
 import { REST } from '@discordjs/rest';
 import { Routes } from 'discord-api-types/v10';
-import opusPkg from '@discordjs/opus';
-const { OpusEncoder } = opusPkg;
 
 // --- crash logging ---
 process.on('uncaughtException', (e) => { console.error('UNCAUGHT', e); process.exit(1); });
@@ -43,10 +40,10 @@ const {
   PORT = 8080,
   LOG_LEVEL = 'info',
   CHUNK_MS = '20',
-  // VAD / credit controls
-  VAD_THRESHOLD = '900',        // PCM S16LE RMS gate (~400–1500 typical)
-  VAD_HANG_MS = '250',          // keep sending for this long after last voice
-  IDLE_CLOSE_MS = '45000'       // close WS after this idle time (no mic / no playback)
+  // cost controls (defaults are credit-friendly already)
+  VAD_THRESHOLD = '800',      // lower than before to ensure trigger
+  VAD_HANG_MS = '300',
+  IDLE_CLOSE_MS = '45000'
 } = process.env;
 
 const log = pino({ level: LOG_LEVEL });
@@ -106,7 +103,8 @@ let connection = null;
 let audioPlayer = null;
 let shouldStayInVC = false;
 
-const playbackPCM16k = new PassThrough({ highWaterMark: 1 << 24 }); // agent writes 16k mono PCM here
+// agent writes 16k mono PCM here
+const playbackPCM16k = new PassThrough({ highWaterMark: 1 << 24 });
 
 // ffmpeg: 16k mono → 48k stereo PCM
 function resample16kTo48k() {
@@ -126,39 +124,30 @@ function resample16kTo48k() {
   return ff;
 }
 
-// Opus encoder (Discord wants 48k stereo Opus frames)
-const opusEnc = new OpusEncoder(48000, 2);
-
-// wrap PCM48 stereo → Opus packets stream
-function pcm48StereoToOpusStream() {
-  const out = new PassThrough({ highWaterMark: 1 << 24 });
-  let pcmBuf = Buffer.alloc(0);
-  const frameSamples = 960; // 20ms @48kHz
-  const frameBytes = frameSamples * 2 /*bytes*/ * 2 /*channels*/;
-
-  const input = new PassThrough({ highWaterMark: 1 << 24 });
-  input.on('data', (chunk) => {
-    pcmBuf = Buffer.concat([pcmBuf, chunk]);
-    while (pcmBuf.length >= frameBytes) {
-      const frame = pcmBuf.subarray(0, frameBytes);
-      const encoded = opusEnc.encode(frame, frameSamples);
-      out.write(encoded);
-      pcmBuf = pcmBuf.subarray(frameBytes);
-    }
-  });
-  input.on('end', () => out.end());
-  return { in: input, out };
-}
-
 const resampler = resample16kTo48k();
-const { in: pcm48In, out: opusOut } = pcm48StereoToOpusStream();
-playbackPCM16k.pipe(resampler).pipe(pcm48In);
+
+// prism’s Opus encoder (stable)
+const opusEncoder = new prism.opus.Encoder({
+  rate: 48000,
+  channels: 2,
+  frameSize: 960
+});
+opusEncoder.on('error', (e) => console.error('opusEncoder error:', e));
+
+// wiring: agent 16k PCM -> resampler -> encoder -> audio resource
+playbackPCM16k.pipe(resampler).pipe(opusEncoder);
 
 function ensureAudioPlayer() {
   if (audioPlayer) return audioPlayer;
-  audioPlayer = createAudioPlayer();
-  audioPlayer.on(AudioPlayerStatus.Idle, () => {});
-  const resource = createAudioResource(opusOut, { inputType: StreamType.Opus });
+  audioPlayer = createAudioPlayer({
+    behaviors: { noSubscriber: NoSubscriberBehavior.Play } // don't auto-stop, keeps resource hot
+  });
+  audioPlayer.on('error', (e) => console.error('AudioPlayer error:', e));
+  audioPlayer.on(AudioPlayerStatus.Playing, () => log.info('AudioPlayer: playing'));
+  audioPlayer.on(AudioPlayerStatus.Idle, () => log.info('AudioPlayer: idle'));
+
+  // IMPORTANT: we’re feeding RAW Opus packets
+  const resource = createAudioResource(opusEncoder, { inputType: StreamType.Opus });
   audioPlayer.play(resource);
   return audioPlayer;
 }
@@ -173,6 +162,7 @@ function playBeep() {
     pcm.writeInt16LE((Math.max(-1, Math.min(1, sample)) * 32767) | 0, i * 2);
   }
   playbackPCM16k.write(pcm);
+  log.info('Beep PCM written');
 }
 
 // ---------------- Join/Leave + Auto-rejoin guard ----------------
@@ -185,7 +175,9 @@ async function joinVoice(guild, voiceChannel) {
     selfDeaf: false,
     selfMute: false
   });
-  connection.subscribe(ensureAudioPlayer());
+  const player = ensureAudioPlayer();
+  const sub = connection.subscribe(player);
+  log.info('Subscribed to audioPlayer', { sub: !!sub });
   watchVoiceConnection(connection, guild, voiceChannel);
 }
 
@@ -210,14 +202,12 @@ let idleTimer = null;
 function resetIdleTimer() {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
-    // close ElevenLabs WS if idle to save credits
     console.log(`Idle ${IDLE_CLOSE_MS}ms — closing Eleven WS to save credits`);
     stopEleven();
   }, Number(IDLE_CLOSE_MS));
 }
 
 function rms(buf) {
-  // 16-bit signed PCM mono
   let sum = 0;
   for (let i = 0; i < buf.length; i += 2) {
     const s = buf.readInt16LE(i);
@@ -236,14 +226,12 @@ function listenToUser(userId) {
     end: { behavior: EndBehaviorType.AfterSilence, duration: 800 }
   });
 
-  // DEBUG: confirm incoming mic Opus packets
   opusStream.on('data', (c) => console.log('opus chunk', c.length));
   opusStream.on('error', (e) => console.error('opusStream error:', e));
 
   const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
   decoder.on('error', (e) => console.error('opus decoder error:', e));
 
-  // downsample to 16k mono
   const downsampler = new prism.FFmpeg({
     command: ffmpegPath,
     args: [
@@ -262,27 +250,24 @@ function listenToUser(userId) {
 
   let sendBuffer = Buffer.alloc(0);
   downsampler.on('data', (chunk) => {
-    resetIdleTimer(); // activity
-    // VAD gating: accumulate only if above threshold or currently talking
+    resetIdleTimer();
     const level = rms(chunk);
     const now = Date.now();
+
     if (level >= VAD_THRESH) {
       vadTalking = true;
       vadLastVoiceAt = now;
       sendBuffer = Buffer.concat([sendBuffer, chunk]);
     } else if (vadTalking && (now - vadLastVoiceAt) < VAD_HANG) {
-      // within hang time, still include
       sendBuffer = Buffer.concat([sendBuffer, chunk]);
     }
 
-    // slice into fixed chunks while talking
     while (vadTalking && sendBuffer.length >= chunkBytes) {
       const slice = sendBuffer.subarray(0, chunkBytes);
       sendUserAudioChunk(slice);
       sendBuffer = sendBuffer.subarray(chunkBytes);
     }
 
-    // If we were talking and exceeded hang without voice -> end utterance
     if (vadTalking && (now - vadLastVoiceAt) >= VAD_HANG) {
       if (sendBuffer.length) sendUserAudioChunk(sendBuffer);
       sendBuffer = Buffer.alloc(0);
@@ -391,11 +376,9 @@ async function connectElevenWS() {
       }
       if (data.type === 'audio') {
         resetIdleTimer();
-        // agent audio is PCM16k mono; push straight into playback chain
-        const buf = Buffer.from(data.audio_event.audio_base_64, 'base64');
+        const buf = Buffer.from(data.audio_event.audio_base_64, 'base64'); // PCM 16k mono
         playbackPCM16k.write(buf);
-        // debug
-        // console.log('audio evt', data.audio_event.event_id, 'len', data.audio_event.audio_base_64.length);
+        // console.log('audio evt', data.audio_event.event_id);
       }
     } catch { /* ignore */ }
   });
@@ -415,14 +398,11 @@ async function connectElevenWS() {
 function sendUserAudioChunk(buf) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ user_audio_chunk: buf.toString('base64') }));
-    bytesSent += buf.length;
   }
 }
 function sendUserAudioEnd() {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    console.log(`user_audio_end (sentBytes=${bytesSent})`);
     ws.send(JSON.stringify({ user_audio_end: true }));
-    bytesSent = 0;
   }
 }
 
@@ -444,6 +424,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       } catch {}
       if (!ELEVEN_AGENT_ID) { await interaction.editReply('Missing ELEVEN_AGENT_ID. Set it in Railway Variables.'); return; }
       if (USE_SIGNED_URL === 'true' && !ELEVEN_API_KEY) { await interaction.editReply('Missing ELEVEN_API_KEY (signed URL mode).'); return; }
+
       await connectElevenWS();
       listenToUser(interaction.user.id);
       await interaction.editReply('Joined VC and listening to you.');
@@ -486,7 +467,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const mode = interaction.options.getString('mode', true);
       if (!ws || ws.readyState !== WebSocket.OPEN) { await interaction.reply({ content: 'Agent not connected. Use /dao-join first.', ephemeral: true }); return; }
       const on = mode === 'on';
-      // Nudge agent to keep replies short to save credits
       ws.send(JSON.stringify({ type: 'contextual_update', text: on ? 'Keep replies brief: 1–2 sentences max.' : 'You can reply normally again.' }));
       await interaction.reply({ content: `Brief mode ${on ? 'enabled' : 'disabled'}.`, ephemeral: true });
     }
