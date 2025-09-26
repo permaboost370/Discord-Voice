@@ -422,7 +422,18 @@ async function connectElevenWS() {
         return;
       }
 
-      // ElevenLabs realtime responds with incremental audio
+      // NEW: Legacy audio event support
+      if (msg.type === 'audio' && msg.audio_event?.audio_base_64) {
+        resetIdleTimer();
+        const buf = Buffer.from(msg.audio_event.audio_base_64, 'base64'); // 16k mono PCM
+        console.log('↓ audio (legacy)', buf.length, 'bytes');
+        if (!playbackPCM16k.write(buf)) {
+          playbackPCM16k.once('drain', () => {});
+        }
+        return;
+      }
+
+      // ElevenLabs realtime: incremental audio chunks
       if (msg.type === 'audio.delta' && msg.delta) {
         resetIdleTimer();
         const buf = Buffer.from(msg.delta, 'base64'); // 16k mono PCM
